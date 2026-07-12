@@ -1,0 +1,6 @@
+# Temporary directories left only if a collection process is interrupted.
+.agent-conversations-*.tmp-*/
+
+# Local editor/OS files.
+.DS_Store
+*.swp
