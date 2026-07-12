@@ -1,0 +1,10 @@
+created_at_utc=2026-07-12T22:58:59Z
+source_home=/home/sprite
+format_version=2
+layout=one_jsonl_file_per_conversation
+claude_conversations=11
+claude_bytes=13234569
+codex_conversations=16
+codex_bytes=13617894
+crush_conversations=5
+crush_bytes=1033410
