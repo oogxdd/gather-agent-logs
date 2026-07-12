@@ -35,19 +35,23 @@ code, commands, paths, and other sensitive information.
 
 ## Collecting from multiple Sprites
 
-Keep the collector itself on `main`. Put each Sprite's exported snapshot on a
-separate branch, then push that branch explicitly. A simple flow on another
-Sprite is:
+Keep the collector itself on `main` and accumulate private snapshots on the
+`conversations` branch. Each Sprite writes to its own directory. On another
+Sprite, use:
 
 ```bash
 git clone git@github.com:oogxdd/gather-agent-logs.git
 cd gather-agent-logs
-git switch -c conversations/MY-SPRITE
-./collect-agent-conversations.sh snapshots
-git add snapshots
+git switch conversations
+git pull --rebase
+SPRITE_NAME=$(hostname)
+./collect-agent-conversations.sh "snapshots/$SPRITE_NAME"
+git add "snapshots/$SPRITE_NAME"
 git commit -m "Add MY-SPRITE conversations"
-git push -u origin conversations/MY-SPRITE
+git push
 ```
 
-Do not merge a conversations branch into `main` unless you intentionally want
+If the `conversations` branch does not exist yet, create it once with
+`git switch -c conversations`. Do not merge the conversations branch into
+`main` unless you intentionally want
 the private logs in the default branch.
