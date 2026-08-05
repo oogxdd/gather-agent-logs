@@ -1,57 +1,45 @@
-# gather-agent-logs
+# gather-codex-logs
 
-Collect local Claude Code, Codex, and Crush conversations into a portable
-snapshot. The output contains one JSONL file per conversation and excludes
-credentials, agent configuration, prompt-history indexes, and the Crush SQLite
-database.
+Copies all your local Codex conversations into one folder.
 
-## Usage
+## Run it
 
 ```bash
-./collect-agent-conversations.sh DESTINATION_ROOT
+git clone -b codex https://github.com/oogxdd/gather-agent-logs.git
+cd gather-agent-logs
+./collect-codex-logs.sh
 ```
 
-The command creates a timestamped directory:
+That's it. The script prints the exact path when it's done.
+
+## Where the files go
+
+By default: into the folder you ran the command from.
 
 ```text
-DESTINATION_ROOT/
-└── agent-conversations-YYYYMMDDTHHMMSSZ/
-    ├── claude/        # One native JSONL event log per conversation
-    ├── codex/         # One native JSONL rollout per conversation
-    ├── crush/         # One exported JSONL file per session
-    ├── manifest.txt
-    └── checksums.sha256
+./codex-logs-20260805T183000Z/
+└── 2026/08/05/rollout-2026-08-05T18-30-00-<id>.jsonl   <- one file per conversation
 ```
 
-To collect histories from a home directory other than the current user's:
+To save somewhere else, pass a folder:
 
 ```bash
-./collect-agent-conversations.sh DESTINATION_ROOT --home /home/username
+./collect-codex-logs.sh ~/Desktop
+# -> ~/Desktop/codex-logs-20260805T183000Z/
 ```
 
-Python 3 and standard GNU/Linux command-line tools are required. Output files
-are created with private permissions because conversations can contain source
-code, commands, paths, and other sensitive information.
+## Where it reads from
 
-## Collecting from multiple Sprites
+`~/.codex/sessions` (or `$CODEX_HOME/sessions` if you set that variable).
 
-Keep the collector itself on `main` and accumulate private snapshots on the
-`conversations` branch. Each Sprite writes to its own directory. On another
-Sprite, use:
+Nothing else is read — no config, no API keys, no auth files. Your original
+logs stay exactly where they are; this only copies them.
 
-```bash
-git clone git@github.com:oogxdd/gather-agent-logs.git
-cd gather-agent-logs
-git switch conversations
-git pull --rebase
-SPRITE_NAME=$(hostname)
-./collect-agent-conversations.sh "snapshots/$SPRITE_NAME"
-git add "snapshots/$SPRITE_NAME"
-git commit -m "Add MY-SPRITE conversations"
-git push
-```
+## Requirements
 
-If the `conversations` branch does not exist yet, create it once with
-`git switch -c conversations`. Do not merge the conversations branch into
-`main` unless you intentionally want
-the private logs in the default branch.
+`bash` and `python3`. macOS and Linux both ship with these.
+
+## Note
+
+The copied files contain your full conversations: source code, file paths,
+shell commands. Keep them private.
