@@ -1,16 +1,26 @@
 # gather-codex-logs
 
-Copies all your local Codex conversations into one folder.
+Copies your local Codex conversations into one folder.
 
-## Run it
+## Start small
+
+Grab the last 10 conversations first, see what you get:
 
 ```bash
 git clone -b codex https://github.com/oogxdd/gather-agent-logs.git
 cd gather-agent-logs
-./collect-codex-logs.sh
+./collect-codex-logs.sh -n 10
 ```
 
-That's it. The script prints the exact path when it's done.
+The script prints the exact path when it's done:
+
+```text
+Copied 10 of 137 conversations (48M)
+Saved to: /Users/you/gather-agent-logs/codex-logs-20260805T183000Z
+```
+
+Open that folder, look at a file, and if it's what you want — run it again
+without `-n` to get everything.
 
 ## Where the files go
 
@@ -24,8 +34,18 @@ By default: into the folder you ran the command from.
 To save somewhere else, pass a folder:
 
 ```bash
-./collect-codex-logs.sh ~/Desktop
+./collect-codex-logs.sh ~/Desktop -n 10
 # -> ~/Desktop/codex-logs-20260805T183000Z/
+```
+
+## All the options
+
+```text
+./collect-codex-logs.sh [FOLDER] [-n N]
+
+  FOLDER          where to save (default: current directory)
+  -n, --limit N   copy only the N most recent conversations
+  -h, --help      show this message
 ```
 
 ## Where it reads from
