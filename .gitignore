@@ -4,3 +4,6 @@
 # Local editor/OS files.
 .DS_Store
 *.swp
+
+# Rust build output.
+/target/

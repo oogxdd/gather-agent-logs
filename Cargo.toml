@@ -1,0 +1,19 @@
+[package]
+name = "agent-resume"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A fast terminal picker for resuming local Codex and Claude Code sessions"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4.6", features = ["derive"] }
+crossterm = "0.29"
+nucleo-matcher = "0.3.1"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+serde_json = "1.0"
+
+[profile.release]
+lto = "thin"
+strip = true
