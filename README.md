@@ -15,20 +15,28 @@ recent work first, and hands the selected session back to the original CLI.
 └───────────────────────────────────┴─────────────────────────┘
 ```
 
-## Install and run
+## Quick start
 
-Rust 1.88 or newer is required.
+Requirements:
 
-```bash
-cargo install --path .
-agent-resume
-```
+- Rust 1.88 or newer
+- Codex, Claude Code, or both installed and available on `PATH`
 
-To try it without installing:
+From the repository root, launch the picker without installing it:
 
 ```bash
 cargo run --release
 ```
+
+To install it as a regular command:
+
+```bash
+cargo install --locked --path .
+agent-resume
+```
+
+Cargo normally installs the binary into `~/.cargo/bin`. Add that directory to
+`PATH` if your shell cannot find `agent-resume` after installation.
 
 The default scan locations are:
 
@@ -39,6 +47,10 @@ Choose a session and press `Enter`, including directly from search. The picker
 restores the terminal, changes to the session's saved working directory, and
 runs either `codex resume SESSION_ID` or `claude --resume SESSION_ID`. On Unix,
 the native agent replaces `agent-resume`, so no wrapper process remains.
+
+Session files are read-only. If a session's saved working directory no longer
+exists, the picker stops with an error instead of resuming it in the wrong
+project.
 
 ## Keys
 
@@ -90,6 +102,26 @@ are excluded from the top-level session list.
 
 The TUI keeps the metadata list but only renders the visible viewport. It does
 not load full transcripts and never modifies session files.
+
+## Troubleshooting
+
+Check what the scanner sees without opening the TUI:
+
+```bash
+agent-resume --list
+```
+
+If no sessions are found, confirm the agent-specific directory and override it
+when necessary:
+
+```bash
+agent-resume --codex-dir ~/.codex/sessions
+agent-resume --claude-dir ~/.claude/projects
+```
+
+If selecting a session reports that `codex` or `claude` cannot be launched,
+run the corresponding command directly to confirm it is installed and on
+`PATH`.
 
 ## Development
 
