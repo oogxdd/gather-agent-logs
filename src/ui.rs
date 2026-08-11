@@ -88,6 +88,12 @@ enum Mode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Focus {
+    Sessions,
+    Details,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Action {
     Continue,
     Quit,
@@ -100,8 +106,13 @@ struct App {
     searchable: Vec<String>,
     query: String,
     mode: Mode,
+    focus: Focus,
+    pending_g: bool,
     selected_position: Option<usize>,
     scroll_offset: usize,
+    list_viewport_height: usize,
+    details_scroll: u16,
+    details_max_scroll: u16,
     skipped: usize,
 }
 
@@ -116,8 +127,13 @@ impl App {
             searchable,
             query: String::new(),
             mode: Mode::Browse,
+            focus: Focus::Sessions,
+            pending_g: false,
             selected_position,
             scroll_offset: 0,
+            list_viewport_height: 10,
+            details_scroll: 0,
+            details_max_scroll: 0,
             skipped,
         }
     }
@@ -143,7 +159,11 @@ impl App {
                 self.mode = Mode::Browse;
                 self.refilter();
             }
-            KeyCode::Enter => self.mode = Mode::Browse,
+            KeyCode::Enter if !self.filtered.is_empty() => return Action::Resume,
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.mode = Mode::Browse;
+                self.focus = Focus::Sessions;
+            }
             KeyCode::Backspace => {
                 self.query.pop();
                 self.refilter();
@@ -162,8 +182,50 @@ impl App {
     }
 
     fn handle_browse_key(&mut self, key: KeyEvent) -> Action {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            let action = match key.code {
+                KeyCode::Char('w') => {
+                    self.toggle_focus();
+                    Some(Action::Continue)
+                }
+                KeyCode::Char('d') => {
+                    self.scroll_focused(self.half_page_step());
+                    Some(Action::Continue)
+                }
+                KeyCode::Char('u') => {
+                    self.scroll_focused(-self.half_page_step());
+                    Some(Action::Continue)
+                }
+                KeyCode::Char('f') => {
+                    self.scroll_focused(self.page_step());
+                    Some(Action::Continue)
+                }
+                KeyCode::Char('b') => {
+                    self.scroll_focused(-self.page_step());
+                    Some(Action::Continue)
+                }
+                _ => None,
+            };
+            if let Some(action) = action {
+                self.pending_g = false;
+                return action;
+            }
+        }
+
+        if key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
+            if self.pending_g {
+                self.pending_g = false;
+                self.jump_to_start();
+            } else {
+                self.pending_g = true;
+            }
+            return Action::Continue;
+        }
+        self.pending_g = false;
+
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+            KeyCode::Enter if !self.filtered.is_empty() => Action::Resume,
             KeyCode::Char('/') => {
                 self.mode = Mode::Search;
                 Action::Continue
@@ -173,32 +235,105 @@ impl App {
                 self.refilter();
                 Action::Continue
             }
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.toggle_focus();
+                Action::Continue
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.focus = Focus::Sessions;
+                Action::Continue
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.focus = Focus::Details;
+                Action::Continue
+            }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.move_selection(-1);
+                self.scroll_focused(-1);
                 Action::Continue
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.move_selection(1);
+                self.scroll_focused(1);
                 Action::Continue
             }
             KeyCode::PageUp => {
-                self.move_selection(-10);
+                self.scroll_focused(-self.page_step());
                 Action::Continue
             }
             KeyCode::PageDown => {
-                self.move_selection(10);
+                self.scroll_focused(self.page_step());
                 Action::Continue
             }
-            KeyCode::Home | KeyCode::Char('g') => {
-                self.select_position(0);
+            KeyCode::Home => {
+                self.jump_to_start();
                 Action::Continue
             }
             KeyCode::End | KeyCode::Char('G') => {
-                self.select_position(self.filtered.len().saturating_sub(1));
+                self.jump_to_end();
                 Action::Continue
             }
-            KeyCode::Enter if !self.filtered.is_empty() => Action::Resume,
+            KeyCode::Char('H') if self.focus == Focus::Sessions => {
+                self.select_position(self.scroll_offset);
+                Action::Continue
+            }
+            KeyCode::Char('M') if self.focus == Focus::Sessions => {
+                self.select_position(
+                    self.scroll_offset
+                        .saturating_add(self.list_viewport_height / 2),
+                );
+                Action::Continue
+            }
+            KeyCode::Char('L') if self.focus == Focus::Sessions => {
+                self.select_position(
+                    self.scroll_offset
+                        .saturating_add(self.list_viewport_height.saturating_sub(1)),
+                );
+                Action::Continue
+            }
             _ => Action::Continue,
+        }
+    }
+
+    fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::Sessions => Focus::Details,
+            Focus::Details => Focus::Sessions,
+        };
+    }
+
+    fn page_step(&self) -> isize {
+        match self.focus {
+            Focus::Sessions => self.list_viewport_height.max(1) as isize,
+            Focus::Details => 6,
+        }
+    }
+
+    fn half_page_step(&self) -> isize {
+        (self.page_step() / 2).max(1)
+    }
+
+    fn scroll_focused(&mut self, delta: isize) {
+        match self.focus {
+            Focus::Sessions => self.move_selection(delta),
+            Focus::Details => {
+                self.details_scroll = self
+                    .details_scroll
+                    .saturating_add_signed(delta.clamp(i16::MIN as isize, i16::MAX as isize) as i16)
+                    .min(self.details_max_scroll);
+            }
+        }
+    }
+
+    fn jump_to_start(&mut self) {
+        match self.focus {
+            Focus::Sessions => self.select_position(0),
+            Focus::Details => self.details_scroll = 0,
+        }
+    }
+
+    fn jump_to_end(&mut self) {
+        match self.focus {
+            Focus::Sessions => self.select_position(self.filtered.len().saturating_sub(1)),
+            Focus::Details => self.details_scroll = self.details_max_scroll,
         }
     }
 
@@ -216,8 +351,13 @@ impl App {
         if self.filtered.is_empty() {
             self.selected_position = None;
             self.scroll_offset = 0;
+            self.details_scroll = 0;
         } else {
-            self.selected_position = Some(position.min(self.filtered.len() - 1));
+            let position = position.min(self.filtered.len() - 1);
+            if self.selected_position != Some(position) {
+                self.details_scroll = 0;
+            }
+            self.selected_position = Some(position);
         }
     }
 
@@ -300,9 +440,11 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     let help = if app.mode == Mode::Search {
-        "type to filter  Enter keep filter  Esc clear"
+        "type to filter  Enter resume  Tab keep filter  Esc clear"
+    } else if app.focus == Focus::Details {
+        "DETAILS  j/k scroll  gg/G ends  Ctrl+d/u page  Ctrl+w/h pane  Enter resume  q quit"
     } else {
-        "↑/k ↓/j move  PgUp/PgDn jump  / search  c clear  Enter resume  q quit"
+        "SESSIONS  j/k move  gg/G ends  Ctrl+d/u page  Ctrl+w/l pane  / search  Enter resume  q quit"
     };
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
@@ -347,6 +489,7 @@ fn render_search(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn render_sessions(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let viewport_height = area.height.saturating_sub(3).max(1) as usize;
+    app.list_viewport_height = viewport_height;
     app.ensure_selection_is_visible(viewport_height);
     let start = app.scroll_offset;
     let end = (start + viewport_height).min(app.filtered.len());
@@ -374,7 +517,12 @@ fn render_sessions(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Row::new(["Agent", "Updated", "Project", "First prompt"])
                 .style(Style::default().fg(Color::DarkGray)),
         )
-        .block(Block::default().title(" Sessions ").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(" Sessions ")
+                .borders(Borders::ALL)
+                .border_style(focus_style(app.focus == Focus::Sessions)),
+        )
         .row_highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -392,7 +540,7 @@ fn render_sessions(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut table_state);
 }
 
-fn render_details(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_details(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let lines = if let Some(session) = app.selected() {
         vec![
             Line::from(vec![
@@ -409,7 +557,7 @@ fn render_details(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ]),
             Line::from(vec![
                 Span::styled("ID      ", Style::default().fg(Color::DarkGray)),
-                Span::raw(&session.id),
+                Span::raw(session.id.clone()),
             ]),
             Line::from(""),
             Line::from(session.title.clone()),
@@ -428,12 +576,32 @@ fn render_details(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         format!(" Details · {} skipped ", app.skipped)
     };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().title(title).borders(Borders::ALL)),
-        area,
+    let content_width = area.width.saturating_sub(2).max(1) as usize;
+    let visible_height = area.height.saturating_sub(2) as usize;
+    let wrapped_height: usize = lines
+        .iter()
+        .map(|line| line.width().div_ceil(content_width).max(1))
+        .sum();
+    app.details_max_scroll = wrapped_height
+        .saturating_sub(visible_height)
+        .min(u16::MAX as usize) as u16;
+    app.details_scroll = app.details_scroll.min(app.details_max_scroll);
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(focus_style(app.focus == Focus::Details)),
     );
+    frame.render_widget(paragraph.scroll((app.details_scroll, 0)), area);
+}
+
+fn focus_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
 }
 
 fn age(session: &Session) -> String {
@@ -456,8 +624,9 @@ mod tests {
     use std::path::PathBuf;
 
     use chrono::{TimeZone, Utc};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::App;
+    use super::{Action, App, Focus, Mode};
     use crate::model::{Agent, Session};
 
     fn session(agent: Agent, title: &str, cwd: &str) -> Session {
@@ -505,5 +674,75 @@ mod tests {
         app.select_position(3);
         app.ensure_selection_is_visible(5);
         assert_eq!(app.scroll_offset, 3);
+    }
+
+    #[test]
+    fn ctrl_w_switches_focus_and_details_use_vim_scrolling() {
+        let mut app = App::new(vec![session(Agent::Codex, "Session", "/work/project")], 0);
+        app.details_max_scroll = 20;
+
+        let action = app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(action, Action::Continue);
+        assert_eq!(app.focus, Focus::Details);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.details_scroll, 4);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.focus, Focus::Sessions);
+    }
+
+    #[test]
+    fn double_g_and_uppercase_g_jump_to_session_ends() {
+        let sessions = (0..20)
+            .map(|index| {
+                session(
+                    Agent::Codex,
+                    &format!("Session {index}"),
+                    &format!("/work/project-{index}"),
+                )
+            })
+            .collect();
+        let mut app = App::new(sessions, 0);
+        app.select_position(8);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert_eq!(app.selected_position, Some(8));
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert_eq!(app.selected_position, Some(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        assert_eq!(app.selected_position, Some(19));
+    }
+
+    #[test]
+    fn enter_resumes_directly_from_search() {
+        let mut app = App::new(vec![session(Agent::Claude, "Session", "/work/project")], 0);
+        app.mode = Mode::Search;
+
+        let action = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(action, Action::Resume);
+    }
+
+    #[test]
+    fn tab_keeps_search_results_for_vim_navigation() {
+        let mut app = App::new(
+            vec![
+                session(Agent::Codex, "Backend", "/work/backend"),
+                session(Agent::Claude, "Frontend", "/work/frontend"),
+            ],
+            0,
+        );
+        app.mode = Mode::Search;
+        app.query = "frontend".to_owned();
+        app.refilter();
+
+        let action = app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert_eq!(action, Action::Continue);
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.filtered, vec![1]);
     }
 }

@@ -35,18 +35,23 @@ The default scan locations are:
 - Codex: `$CODEX_HOME/sessions`, otherwise `~/.codex/sessions`
 - Claude Code: `$CLAUDE_CONFIG_DIR/projects`, otherwise `~/.claude/projects`
 
-Choose a session and press `Enter`. The picker restores the terminal, changes
-to the session's saved working directory when it still exists, and runs either
-`codex resume SESSION_ID` or `claude --resume SESSION_ID`.
+Choose a session and press `Enter`, including directly from search. The picker
+restores the terminal, changes to the session's saved working directory, and
+runs either `codex resume SESSION_ID` or `claude --resume SESSION_ID`. On Unix,
+the native agent replaces `agent-resume`, so no wrapper process remains.
 
 ## Keys
 
 | Key | Action |
 | --- | --- |
-| `↑` / `k`, `↓` / `j` | Move through sessions |
-| `PgUp`, `PgDn`, `g`, `G` | Jump through the list |
-| `/` | Fuzzy-search title, project, path, agent, or session ID |
-| `Enter` | Keep a search, or resume the selected session |
+| `↑` / `k`, `↓` / `j` | Move or scroll the focused pane |
+| `gg`, `G` | Jump to the start or end |
+| `Ctrl+U`, `Ctrl+D` | Move half a page |
+| `Ctrl+B`, `Ctrl+F`, `PgUp`, `PgDn` | Move a full page |
+| `H`, `M`, `L` | Select the top, middle, or bottom visible session |
+| `Ctrl+W`, `Tab`, `h` / `l` | Switch between sessions and details |
+| `/` | Fuzzy-search; `Tab` keeps the filter for navigation |
+| `Enter` | Resume the selected session, including while searching |
 | `Esc` | Clear an active search; otherwise quit |
 | `c` | Clear a kept search |
 | `q`, `Ctrl+C` | Quit |

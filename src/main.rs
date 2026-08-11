@@ -145,6 +145,30 @@ fn print_sessions(sessions: &[Session]) {
 }
 
 fn resume(session: &Session) -> Result<u8> {
+    let mut command = resume_command(session)?;
+    let executable = session.agent.executable();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        let error = command.exec();
+        Err(error).with_context(|| {
+            format!("could not launch {executable}; make sure it is installed and on PATH")
+        })
+    }
+
+    #[cfg(not(unix))]
+    {
+        let status = command.status().with_context(|| {
+            format!("could not launch {executable}; make sure it is installed and on PATH")
+        })?;
+
+        Ok(status.code().unwrap_or(1).clamp(0, u8::MAX as i32) as u8)
+    }
+}
+
+fn resume_command(session: &Session) -> Result<Command> {
     let mut command = match session.agent {
         Agent::Codex => {
             let mut command = Command::new("codex");
@@ -158,16 +182,68 @@ fn resume(session: &Session) -> Result<u8> {
         }
     };
 
-    if session.cwd.is_dir() {
+    if !session.cwd.as_os_str().is_empty() && !session.cwd.is_dir() {
+        bail!(
+            "saved working directory no longer exists: {}",
+            session.cwd.display()
+        );
+    }
+    if !session.cwd.as_os_str().is_empty() {
         command.current_dir(&session.cwd);
     }
 
-    let status = command.status().with_context(|| {
-        format!(
-            "could not launch {}; make sure it is installed and on PATH",
-            session.agent.executable()
-        )
-    })?;
+    Ok(command)
+}
 
-    Ok(status.code().unwrap_or(1).clamp(0, u8::MAX as i32) as u8)
+#[cfg(test)]
+mod tests {
+    use std::{ffi::OsStr, path::PathBuf};
+
+    use chrono::Utc;
+
+    use super::resume_command;
+    use crate::model::{Agent, Session};
+
+    fn session(agent: Agent) -> Session {
+        Session {
+            agent,
+            id: "019ff21e-4824-70d2-8cb6-57e5b1aebefb".to_owned(),
+            title: "Test session".to_owned(),
+            cwd: std::env::current_dir().unwrap(),
+            path: PathBuf::from("session.jsonl"),
+            updated: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn codex_resume_uses_native_command_and_saved_directory() {
+        let session = session(Agent::Codex);
+        let command = resume_command(&session).unwrap();
+
+        assert_eq!(command.get_program(), OsStr::new("codex"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                OsStr::new("resume"),
+                OsStr::new("019ff21e-4824-70d2-8cb6-57e5b1aebefb")
+            ]
+        );
+        assert_eq!(command.get_current_dir(), Some(session.cwd.as_path()));
+    }
+
+    #[test]
+    fn claude_resume_uses_native_command_and_saved_directory() {
+        let session = session(Agent::Claude);
+        let command = resume_command(&session).unwrap();
+
+        assert_eq!(command.get_program(), OsStr::new("claude"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                OsStr::new("--resume"),
+                OsStr::new("019ff21e-4824-70d2-8cb6-57e5b1aebefb")
+            ]
+        );
+        assert_eq!(command.get_current_dir(), Some(session.cwd.as_path()));
+    }
 }
