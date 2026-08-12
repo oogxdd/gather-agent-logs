@@ -1,8 +1,14 @@
 # agent-resume
 
-`agent-resume` is a fast terminal picker for returning to local Codex and
-Claude Code sessions. It finds both agents' native JSONL logs, shows the most
-recent work first, and hands the selected session back to the original CLI.
+This repository contains two intentionally equivalent terminal pickers for
+returning to local Codex and Claude Code sessions:
+
+- `agent-resume`: Rust with ratatui, crossterm, and nucleo
+- `agent-resume-go`: Go with Bubble Tea, Bubbles, Lip Gloss, and fuzzy
+
+Both find the agents' native JSONL logs, show the most recent work first, and
+hand the selected session back to the original CLI. Keeping both versions in
+one branch makes their code, UX, build time, and binary size easy to compare.
 
 ```text
 ┌ agent-resume ─────────────────────────────────────── 7 of 7 ┐
@@ -19,10 +25,11 @@ recent work first, and hands the selected session back to the original CLI.
 
 Requirements:
 
-- Rust 1.88 or newer
+- Rust 1.88 or newer for `agent-resume`, or Go 1.25 or newer for
+  `agent-resume-go`
 - Codex, Claude Code, or both installed and available on `PATH`
 
-From the repository root, launch the picker without installing it:
+From the repository root, launch the Rust picker without installing it:
 
 ```bash
 cargo run --release
@@ -38,19 +45,34 @@ agent-resume
 Cargo normally installs the binary into `~/.cargo/bin`. Add that directory to
 `PATH` if your shell cannot find `agent-resume` after installation.
 
+Launch the matching Go/Bubble Tea picker from the same checkout:
+
+```bash
+go -C go run ./cmd/agent-resume-go
+```
+
+To install the Go version as a regular command:
+
+```bash
+go -C go install ./cmd/agent-resume-go
+agent-resume-go
+```
+
+Go normally installs the binary into `$(go env GOPATH)/bin` unless `GOBIN` is
+set. Add that directory to `PATH` if necessary.
+
 The default scan locations are:
 
 - Codex: `$CODEX_HOME/sessions`, otherwise `~/.codex/sessions`
 - Claude Code: `$CLAUDE_CONFIG_DIR/projects`, otherwise `~/.claude/projects`
 
-Choose a session and press `Enter`, including directly from search. The picker
-restores the terminal, changes to the session's saved working directory, and
-runs either `codex resume SESSION_ID` or `claude --resume SESSION_ID`. On Unix,
-the native agent replaces `agent-resume`, so no wrapper process remains.
+Choose a session and press `Enter`, including directly from search. Either
+picker restores the terminal, changes to the session's saved working directory,
+and runs `codex resume SESSION_ID` or `claude --resume SESSION_ID`. On Unix, the
+native agent replaces the picker, so no wrapper process remains.
 
-Session files are read-only. If a session's saved working directory no longer
-exists, the picker stops with an error instead of resuming it in the wrong
-project.
+Session files are read-only. If a saved working directory no longer exists,
+the picker stops with an error instead of resuming in the wrong project.
 
 ## Keys
 
@@ -76,6 +98,7 @@ work as expected.
 
 ```text
 agent-resume [OPTIONS]
+agent-resume-go [OPTIONS]
 
   --agent <all|codex|claude>  Limit the list to one agent
   --sort <updated|created>     Choose the initial sort order
@@ -92,6 +115,10 @@ agent-resume --agent codex
 agent-resume --sort created
 agent-resume --list
 agent-resume --codex-dir /mnt/old-home/.codex/sessions
+
+agent-resume-go --agent claude
+agent-resume-go --sort created
+agent-resume-go --list
 ```
 
 ## How scanning stays light
@@ -132,10 +159,42 @@ run the corresponding command directly to confirm it is installed and on
 
 ## Development
 
+Rust:
+
 ```bash
 cargo fmt --check
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
+```
+
+Go:
+
+```bash
+go -C go fmt ./...
+go -C go test ./...
+go -C go vet ./...
+go -C go build -trimpath -o agent-resume-go ./cmd/agent-resume-go
+```
+
+## Comparing the implementations
+
+The feature contract is deliberately the same: discovery paths and metadata,
+streaming JSONL parsing, fuzzy search, Vim navigation, pane focus, created vs.
+updated sorting, and native resume commands all match.
+
+| Concern | Rust | Go |
+| --- | --- | --- |
+| UI architecture | Explicit event/render loop | Bubble Tea `Model` / `Update` / `View` |
+| Terminal widgets | ratatui + crossterm | Bubbles + Lip Gloss |
+| Fuzzy matching | nucleo | sahilm/fuzzy |
+| Source root | `src/` | `go/` |
+| Run | `cargo run --release` | `go -C go run ./cmd/agent-resume-go` |
+| Release build | `cargo build --release` | `go -C go build -trimpath -ldflags="-s -w" -o agent-resume-go ./cmd/agent-resume-go` |
+
+For a local size comparison after both release builds:
+
+```bash
+ls -lh target/release/agent-resume go/agent-resume-go
 ```
 
 ## Snapshot collector

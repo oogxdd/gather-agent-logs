@@ -7,3 +7,6 @@
 
 # Rust build output.
 /target/
+
+# Local Go build output.
+/go/agent-resume-go
