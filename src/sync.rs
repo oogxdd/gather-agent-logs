@@ -24,7 +24,9 @@ use crate::{
 /// enough that compression stays effective.
 pub const DEFAULT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
-const SIGNATURE_BYTES: usize = 512;
+/// Most of a first record; long enough to identify a session, short enough to
+/// stay cheap on every scan.
+const SIGNATURE_BYTES: usize = 4096;
 
 pub struct SyncOptions {
     pub host: String,
@@ -298,21 +300,15 @@ fn session_id(file: &LogFile) -> Result<Option<String>> {
     Ok(scanner.into_meta().id)
 }
 
-/// Cheap fingerprint of a log file's opening bytes, used to notice that a file
-/// was replaced by a different session rather than appended to.
+/// Cheap fingerprint of a log file's first record, used to notice that a file
+/// was replaced by a different session rather than appended to. It covers the
+/// first line only, so appending to a short file never looks like a rewrite.
 fn signature(path: &Path) -> Result<String> {
-    let mut file =
-        File::open(path).with_context(|| format!("could not open {}", path.display()))?;
-    let mut head = vec![0_u8; SIGNATURE_BYTES];
-    let mut filled = 0;
-    while filled < head.len() {
-        let read = file.read(&mut head[filled..])?;
-        if read == 0 {
-            break;
-        }
-        filled += read;
-    }
-    head.truncate(filled);
+    let file = File::open(path).with_context(|| format!("could not open {}", path.display()))?;
+    let mut head = Vec::new();
+    std::io::BufReader::new(file.take(SIGNATURE_BYTES as u64))
+        .read_until(b'\n', &mut head)
+        .with_context(|| format!("could not read {}", path.display()))?;
 
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in &head {
@@ -366,7 +362,34 @@ pub fn human_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{chunks, human_bytes};
+    use std::{fs, io::Write};
+
+    use super::{chunks, human_bytes, signature};
+
+    #[test]
+    fn appending_does_not_look_like_a_rewrite() {
+        let path = std::env::temp_dir().join("agent-logs-signature-test.jsonl");
+        let _ = fs::remove_file(&path);
+        fs::write(&path, "{\"first\":1}\n").unwrap();
+        let before = signature(&path).unwrap();
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all("{\"second\":2}\n".repeat(40).as_bytes())
+            .unwrap();
+        assert_eq!(
+            signature(&path).unwrap(),
+            before,
+            "a short file that grows is still the same session"
+        );
+
+        fs::write(&path, "{\"different\":1}\n").unwrap();
+        assert_ne!(
+            signature(&path).unwrap(),
+            before,
+            "a replaced first record is a different session"
+        );
+        let _ = fs::remove_file(&path);
+    }
 
     #[test]
     fn chunks_never_split_a_line() {

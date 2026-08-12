@@ -243,10 +243,13 @@ impl Store {
             &[&key],
         )?;
         transaction.execute("DELETE FROM agent_messages WHERE session_key = $1", &[&key])?;
+        // Metadata came from records that no longer exist, so it is cleared
+        // too and rebuilt from whatever the file holds now.
         transaction.execute(
             "UPDATE agent_sessions
              SET synced_bytes = 0, line_count = 0, chunk_count = 0, message_count = 0,
-                 transcript_pruned = false
+                 transcript_pruned = false, signature = '', title = '',
+                 title_is_authoritative = false, created_at = NULL, updated_at = NULL
              WHERE id = $1",
             &[&key],
         )?;
@@ -318,7 +321,9 @@ impl Store {
             )?;
         }
 
-        let keep_stored_title = title_is_authoritative && !delta.title_is_authoritative
+        // An agent-provided title outranks a first-prompt one, and a session
+        // that already has a title never loses it to an empty upload.
+        let keep_stored_title = (title_is_authoritative && !delta.title_is_authoritative)
             || (!stored_title.is_empty() && delta.title.is_none());
         let title = if keep_stored_title { None } else { delta.title };
 
@@ -489,17 +494,46 @@ impl Store {
              LIMIT $4",
             &[&query, &filter.host, &agent, &limit],
         )?;
+        if !rows.is_empty() {
+            return Ok(rows
+                .iter()
+                .map(|row| SearchHit {
+                    session: session_from_row(row),
+                    role: Role::from_key(row.get::<_, String>(11).as_str()),
+                    written_at: row.get(12),
+                    snippet: row
+                        .get::<_, String>(13)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                })
+                .collect());
+        }
+
+        // Word search is unstemmed, so an inflected word ("логов" against
+        // "логи") finds nothing. Fall back to a substring match, which is what
+        // someone typing a fragment usually meant.
+        let pattern = format!("%{}%", query.replace('\\', "\\\\").replace(['%', '_'], ""));
+        let rows = self.client.query(
+            "SELECT s.id, s.host, s.agent, s.session_id, s.title, s.cwd, s.source_path,
+                    s.created_at, s.updated_at, s.synced_bytes, s.message_count,
+                    m.role, m.written_at, m.body
+             FROM agent_messages m
+             JOIN agent_sessions s ON s.id = m.session_key
+             WHERE m.body ILIKE $1
+               AND ($2::text IS NULL OR s.host = $2)
+               AND ($3::text IS NULL OR s.agent = $3)
+             ORDER BY m.written_at DESC NULLS LAST
+             LIMIT $4",
+            &[&pattern, &filter.host, &agent, &limit],
+        )?;
         Ok(rows
             .iter()
             .map(|row| SearchHit {
                 session: session_from_row(row),
                 role: Role::from_key(row.get::<_, String>(11).as_str()),
                 written_at: row.get(12),
-                snippet: row
-                    .get::<_, String>(13)
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" "),
+                snippet: snippet_around(&row.get::<_, String>(13), query),
             })
             .collect())
     }
@@ -542,6 +576,58 @@ impl Store {
     pub fn execute(&mut self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
         Ok(self.client.execute(sql, params)?)
     }
+}
+
+/// Builds an excerpt around the first occurrence of `query`, marked the way
+/// Postgres marks full-text matches.
+fn snippet_around(body: &str, query: &str) -> String {
+    const BEFORE: usize = 40;
+    const AFTER: usize = 120;
+
+    let fold = |text: &str| -> Vec<char> {
+        text.chars()
+            .map(|character| character.to_lowercase().next().unwrap_or(character))
+            .collect()
+    };
+    let characters: Vec<char> = body.chars().collect();
+    let needle = fold(query);
+    let position = if needle.is_empty() || needle.len() > characters.len() {
+        None
+    } else {
+        fold(body)
+            .windows(needle.len())
+            .position(|window| window == needle)
+    };
+
+    let (start, end) = match position {
+        Some(position) => (
+            position.saturating_sub(BEFORE),
+            (position + needle.len() + AFTER).min(characters.len()),
+        ),
+        None => (0, characters.len().min(BEFORE + AFTER)),
+    };
+
+    let mut snippet = String::new();
+    if start > 0 {
+        snippet.push('…');
+    }
+    for (offset, character) in characters[start..end].iter().enumerate() {
+        if let Some(position) = position {
+            if start + offset == position {
+                snippet.push('«');
+            } else if start + offset == position + needle.len() {
+                snippet.push('»');
+            }
+        }
+        snippet.push(*character);
+    }
+    if position.is_some_and(|position| end == position + needle.len()) {
+        snippet.push('»');
+    }
+    if end < characters.len() {
+        snippet.push('…');
+    }
+    snippet.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn session_state_from_row(row: &Row) -> SessionState {
@@ -608,7 +694,33 @@ fn tls_connector() -> Result<MakeRustlsConnect> {
 
 #[cfg(test)]
 mod tests {
-    use super::wants_tls;
+    use super::{snippet_around, wants_tls};
+
+    #[test]
+    fn snippets_mark_the_match_case_insensitively() {
+        let body = "Сначала я собрал ЛОГИ агентов, затем отправил их в базу";
+
+        let snippet = snippet_around(body, "логи");
+
+        assert!(snippet.contains("«ЛОГИ»"), "{snippet}");
+    }
+
+    #[test]
+    fn snippets_trim_long_bodies_around_the_match() {
+        let body = format!("{} needle {}", "a".repeat(400), "b".repeat(400));
+
+        let snippet = snippet_around(&body, "needle");
+
+        assert!(snippet.starts_with('…') && snippet.ends_with('…'), "{snippet}");
+        assert!(snippet.contains("«needle»"));
+        assert!(snippet.chars().count() < 200);
+    }
+
+    #[test]
+    fn snippets_survive_a_query_that_is_not_present() {
+        assert_eq!(snippet_around("short body", "missing"), "short body");
+        assert_eq!(snippet_around("short body", ""), "short body");
+    }
 
     #[test]
     fn tls_is_used_unless_explicitly_disabled() {
