@@ -2,6 +2,36 @@ use std::{fmt, path::PathBuf};
 
 use chrono::{DateTime, Utc};
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SortMode {
+    Created,
+    #[default]
+    Updated,
+}
+
+impl SortMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Updated => "updated",
+        }
+    }
+
+    pub fn timestamp(self, session: &Session) -> DateTime<Utc> {
+        match self {
+            Self::Created => session.created,
+            Self::Updated => session.updated,
+        }
+    }
+
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Created => Self::Updated,
+            Self::Updated => Self::Created,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Agent {
     Codex,
@@ -44,6 +74,7 @@ pub struct Session {
     pub title: String,
     pub cwd: PathBuf,
     pub path: PathBuf,
+    pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
 }
 
@@ -67,6 +98,16 @@ impl Session {
             self.title
         )
     }
+}
+
+pub fn sort_sessions(sessions: &mut [Session], mode: SortMode) {
+    sessions.sort_by(|left, right| {
+        mode.timestamp(right)
+            .cmp(&mode.timestamp(left))
+            .then_with(|| right.updated.cmp(&left.updated))
+            .then_with(|| left.agent.as_str().cmp(right.agent.as_str()))
+            .then_with(|| left.id.cmp(&right.id))
+    });
 }
 
 pub fn clean_title(text: &str) -> Option<String> {
@@ -107,7 +148,11 @@ fn is_injected_context(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::clean_title;
+    use std::path::PathBuf;
+
+    use chrono::{TimeZone, Utc};
+
+    use super::{Agent, Session, SortMode, clean_title, sort_sessions};
 
     #[test]
     fn title_collapses_whitespace() {
@@ -121,5 +166,30 @@ mod tests {
     fn title_rejects_injected_context() {
         assert!(clean_title("<environment_context>cwd=/tmp").is_none());
         assert!(clean_title("# AGENTS.md instructions do things").is_none());
+    }
+
+    #[test]
+    fn sessions_sort_by_created_or_updated_descending() {
+        let make_session = |id: &str, created: i64, updated: i64| Session {
+            agent: Agent::Codex,
+            id: id.to_owned(),
+            title: id.to_owned(),
+            cwd: PathBuf::from("/work"),
+            path: PathBuf::from("session.jsonl"),
+            created: Utc.timestamp_opt(created, 0).unwrap(),
+            updated: Utc.timestamp_opt(updated, 0).unwrap(),
+        };
+        let original = vec![
+            make_session("old-created-new-updated", 100, 400),
+            make_session("new-created-old-updated", 300, 350),
+        ];
+
+        let mut by_created = original.clone();
+        sort_sessions(&mut by_created, SortMode::Created);
+        assert_eq!(by_created[0].id, "new-created-old-updated");
+
+        let mut by_updated = original;
+        sort_sessions(&mut by_updated, SortMode::Updated);
+        assert_eq!(by_updated[0].id, "old-created-new-updated");
     }
 }

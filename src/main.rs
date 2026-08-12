@@ -12,7 +12,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use discovery::{DiscoveryOptions, discover};
-use model::{Agent, Session};
+use model::{Agent, Session, SortMode, sort_sessions};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -24,6 +24,10 @@ struct Cli {
     /// Only show sessions from one agent.
     #[arg(long, value_enum, default_value_t = AgentFilter::All)]
     agent: AgentFilter,
+
+    /// Initial sort order; press s in the picker to toggle it.
+    #[arg(long, value_enum, default_value_t = SortArg::Updated)]
+    sort: SortArg,
 
     /// Use HOME_DIR instead of the current user's home directory.
     #[arg(long, value_name = "HOME_DIR")]
@@ -48,6 +52,22 @@ enum AgentFilter {
     All,
     Codex,
     Claude,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum SortArg {
+    Created,
+    #[default]
+    Updated,
+}
+
+impl From<SortArg> for SortMode {
+    fn from(value: SortArg) -> Self {
+        match value {
+            SortArg::Created => Self::Created,
+            SortArg::Updated => Self::Updated,
+        }
+    }
 }
 
 impl AgentFilter {
@@ -92,12 +112,14 @@ fn run() -> Result<u8> {
         None => default_session_dir(&home, ".claude/projects"),
     };
 
-    let discovered = discover(&DiscoveryOptions {
+    let mut discovered = discover(&DiscoveryOptions {
         codex_dir,
         claude_dir,
         include_codex: cli.agent.includes(Agent::Codex),
         include_claude: cli.agent.includes(Agent::Claude),
     });
+    let sort_mode = SortMode::from(cli.sort);
+    sort_sessions(&mut discovered.sessions, sort_mode);
 
     if cli.list {
         print_sessions(&discovered.sessions);
@@ -117,7 +139,7 @@ fn run() -> Result<u8> {
         bail!("no Codex or Claude Code sessions found");
     }
 
-    let selection = ui::pick(discovered.sessions, discovered.skipped)?;
+    let selection = ui::pick(discovered.sessions, discovered.skipped, sort_mode)?;
     let Some(session) = selection else {
         return Ok(0);
     };
@@ -134,8 +156,9 @@ fn default_session_dir(home: &Option<PathBuf>, relative: &str) -> PathBuf {
 fn print_sessions(sessions: &[Session]) {
     for session in sessions {
         println!(
-            "{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}",
             session.agent.as_str(),
+            session.created.to_rfc3339(),
             session.updated.to_rfc3339(),
             session.id,
             session.cwd.display(),
@@ -211,6 +234,7 @@ mod tests {
             title: "Test session".to_owned(),
             cwd: std::env::current_dir().unwrap(),
             path: PathBuf::from("session.jsonl"),
+            created: Utc::now(),
             updated: Utc::now(),
         }
     }

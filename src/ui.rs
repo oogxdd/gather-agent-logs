@@ -23,9 +23,13 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
 };
 
-use crate::model::{Agent, Session};
+use crate::model::{Agent, Session, SortMode, sort_sessions};
 
-pub fn pick(sessions: Vec<Session>, skipped: usize) -> Result<Option<Session>> {
+pub fn pick(
+    sessions: Vec<Session>,
+    skipped: usize,
+    sort_mode: SortMode,
+) -> Result<Option<Session>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     if let Err(error) = execute!(stdout, EnterAlternateScreen) {
@@ -42,7 +46,7 @@ pub fn pick(sessions: Vec<Session>, skipped: usize) -> Result<Option<Session>> {
         }
     };
 
-    let result = run_picker(&mut terminal, sessions, skipped);
+    let result = run_picker(&mut terminal, sessions, skipped, sort_mode);
 
     let raw_mode_result = disable_raw_mode();
     let screen_result = execute!(terminal.backend_mut(), LeaveAlternateScreen);
@@ -58,8 +62,9 @@ fn run_picker(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     sessions: Vec<Session>,
     skipped: usize,
+    sort_mode: SortMode,
 ) -> Result<Option<Session>> {
-    let mut app = App::new(sessions, skipped);
+    let mut app = App::new(sessions, skipped, sort_mode);
 
     loop {
         terminal.draw(|frame| render(frame, &mut app))?;
@@ -107,6 +112,7 @@ struct App {
     query: String,
     mode: Mode,
     focus: Focus,
+    sort_mode: SortMode,
     pending_g: bool,
     selected_position: Option<usize>,
     scroll_offset: usize,
@@ -117,7 +123,7 @@ struct App {
 }
 
 impl App {
-    fn new(sessions: Vec<Session>, skipped: usize) -> Self {
+    fn new(sessions: Vec<Session>, skipped: usize, sort_mode: SortMode) -> Self {
         let searchable = sessions.iter().map(Session::searchable_text).collect();
         let filtered = (0..sessions.len()).collect();
         let selected_position = (!sessions.is_empty()).then_some(0);
@@ -128,6 +134,7 @@ impl App {
             query: String::new(),
             mode: Mode::Browse,
             focus: Focus::Sessions,
+            sort_mode,
             pending_g: false,
             selected_position,
             scroll_offset: 0,
@@ -235,6 +242,10 @@ impl App {
                 self.refilter();
                 Action::Continue
             }
+            KeyCode::Char('s') => {
+                self.toggle_sort();
+                Action::Continue
+            }
             KeyCode::Tab | KeyCode::BackTab => {
                 self.toggle_focus();
                 Action::Continue
@@ -298,6 +309,25 @@ impl App {
             Focus::Sessions => Focus::Details,
             Focus::Details => Focus::Sessions,
         };
+    }
+
+    fn toggle_sort(&mut self) {
+        let selected_id = self.selected().map(|session| session.id.clone());
+        self.sort_mode = self.sort_mode.toggle();
+        sort_sessions(&mut self.sessions, self.sort_mode);
+        self.searchable = self.sessions.iter().map(Session::searchable_text).collect();
+        self.refilter();
+
+        if let Some(selected_id) = selected_id
+            && let Some(position) = self.filtered.iter().position(|index| {
+                self.sessions
+                    .get(*index)
+                    .is_some_and(|session| session.id == selected_id)
+            })
+        {
+            self.select_position(position);
+        }
+        self.scroll_offset = 0;
     }
 
     fn page_step(&self) -> isize {
@@ -387,26 +417,16 @@ impl App {
         let pattern = Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart);
         let mut matcher = Matcher::new(Config::DEFAULT);
         let mut buffer = Vec::new();
-        let mut matches: Vec<(usize, u32)> = self
+        self.filtered = self
             .searchable
             .iter()
             .enumerate()
             .filter_map(|(index, text)| {
-                let score = pattern.score(Utf32Str::new(text, &mut buffer), &mut matcher)?;
-                Some((index, score))
+                pattern
+                    .score(Utf32Str::new(text, &mut buffer), &mut matcher)
+                    .map(|_| index)
             })
             .collect();
-        matches.sort_by(|(left_index, left_score), (right_index, right_score)| {
-            right_score
-                .cmp(left_score)
-                .then_with(|| {
-                    self.sessions[*right_index]
-                        .updated
-                        .cmp(&self.sessions[*left_index].updated)
-                })
-                .then_with(|| left_index.cmp(right_index))
-        });
-        self.filtered = matches.into_iter().map(|(index, _)| index).collect();
         self.select_position(0);
     }
 }
@@ -442,9 +462,9 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     let help = if app.mode == Mode::Search {
         "type to filter  Enter resume  Tab keep filter  Esc clear"
     } else if app.focus == Focus::Details {
-        "DETAILS  j/k scroll  gg/G ends  Ctrl+d/u page  Ctrl+w/h pane  Enter resume  q quit"
+        "DETAILS  j/k scroll  gg/G ends  Ctrl+d/u page  Ctrl+w/h pane  s sort  Enter resume  q quit"
     } else {
-        "SESSIONS  j/k move  gg/G ends  Ctrl+d/u page  Ctrl+w/l pane  / search  Enter resume  q quit"
+        "SESSIONS  j/k move  gg/G ends  Ctrl+d/u page  Ctrl+w/l pane  s sort  / search  Enter resume"
     };
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
@@ -453,7 +473,12 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 fn render_search(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let count = format!(" {} of {} ", app.filtered.len(), app.sessions.len());
+    let count = format!(
+        " {} of {} · sort: {} ",
+        app.filtered.len(),
+        app.sessions.len(),
+        app.sort_mode.label()
+    );
     let border = if app.mode == Mode::Search {
         Color::Cyan
     } else {
@@ -501,7 +526,7 @@ fn render_sessions(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         };
         Row::new([
             Cell::from(session.agent.label()).style(agent_style),
-            Cell::from(age(session)),
+            Cell::from(age(app.sort_mode.timestamp(session))),
             Cell::from(session.project()),
             Cell::from(session.title.clone()),
         ])
@@ -514,8 +539,16 @@ fn render_sessions(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     ];
     let table = Table::new(rows, widths)
         .header(
-            Row::new(["Agent", "Updated", "Project", "First prompt"])
-                .style(Style::default().fg(Color::DarkGray)),
+            Row::new([
+                "Agent",
+                match app.sort_mode {
+                    SortMode::Created => "Created",
+                    SortMode::Updated => "Updated",
+                },
+                "Project",
+                "First prompt",
+            ])
+            .style(Style::default().fg(Color::DarkGray)),
         )
         .block(
             Block::default()
@@ -546,6 +579,10 @@ fn render_details(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Line::from(vec![
                 Span::styled("Agent   ", Style::default().fg(Color::DarkGray)),
                 Span::raw(session.agent.label()),
+            ]),
+            Line::from(vec![
+                Span::styled("Created ", Style::default().fg(Color::DarkGray)),
+                Span::raw(session.created.format("%Y-%m-%d %H:%M UTC").to_string()),
             ]),
             Line::from(vec![
                 Span::styled("Updated ", Style::default().fg(Color::DarkGray)),
@@ -604,8 +641,8 @@ fn focus_style(focused: bool) -> Style {
     }
 }
 
-fn age(session: &Session) -> String {
-    let duration = Utc::now().signed_duration_since(session.updated);
+fn age(timestamp: chrono::DateTime<Utc>) -> String {
+    let duration = Utc::now().signed_duration_since(timestamp);
     if duration.num_seconds() < 60 {
         "now".to_owned()
     } else if duration.num_minutes() < 60 {
@@ -615,7 +652,7 @@ fn age(session: &Session) -> String {
     } else if duration.num_days() < 30 {
         format!("{}d ago", duration.num_days())
     } else {
-        session.updated.format("%Y-%m-%d").to_string()
+        timestamp.format("%Y-%m-%d").to_string()
     }
 }
 
@@ -627,7 +664,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{Action, App, Focus, Mode};
-    use crate::model::{Agent, Session};
+    use crate::model::{Agent, Session, SortMode};
 
     fn session(agent: Agent, title: &str, cwd: &str) -> Session {
         Session {
@@ -636,6 +673,7 @@ mod tests {
             title: title.to_owned(),
             cwd: PathBuf::from(cwd),
             path: PathBuf::from("session.jsonl"),
+            created: Utc.timestamp_opt(1_600_000_000, 0).unwrap(),
             updated: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
         }
     }
@@ -646,7 +684,7 @@ mod tests {
             session(Agent::Codex, "Fix authentication", "/work/backend"),
             session(Agent::Claude, "Polish the header", "/work/frontend"),
         ];
-        let mut app = App::new(sessions, 0);
+        let mut app = App::new(sessions, 0, SortMode::Updated);
 
         app.query = "frontend header".to_owned();
         app.refilter();
@@ -665,7 +703,7 @@ mod tests {
                 )
             })
             .collect();
-        let mut app = App::new(sessions, 0);
+        let mut app = App::new(sessions, 0, SortMode::Updated);
 
         app.select_position(12);
         app.ensure_selection_is_visible(5);
@@ -678,7 +716,11 @@ mod tests {
 
     #[test]
     fn ctrl_w_switches_focus_and_details_use_vim_scrolling() {
-        let mut app = App::new(vec![session(Agent::Codex, "Session", "/work/project")], 0);
+        let mut app = App::new(
+            vec![session(Agent::Codex, "Session", "/work/project")],
+            0,
+            SortMode::Updated,
+        );
         app.details_max_scroll = 20;
 
         let action = app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
@@ -704,7 +746,7 @@ mod tests {
                 )
             })
             .collect();
-        let mut app = App::new(sessions, 0);
+        let mut app = App::new(sessions, 0, SortMode::Updated);
         app.select_position(8);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
@@ -718,7 +760,11 @@ mod tests {
 
     #[test]
     fn enter_resumes_directly_from_search() {
-        let mut app = App::new(vec![session(Agent::Claude, "Session", "/work/project")], 0);
+        let mut app = App::new(
+            vec![session(Agent::Claude, "Session", "/work/project")],
+            0,
+            SortMode::Updated,
+        );
         app.mode = Mode::Search;
 
         let action = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -734,6 +780,7 @@ mod tests {
                 session(Agent::Claude, "Frontend", "/work/frontend"),
             ],
             0,
+            SortMode::Updated,
         );
         app.mode = Mode::Search;
         app.query = "frontend".to_owned();
@@ -744,5 +791,23 @@ mod tests {
         assert_eq!(action, Action::Continue);
         assert_eq!(app.mode, Mode::Browse);
         assert_eq!(app.filtered, vec![1]);
+    }
+
+    #[test]
+    fn s_toggles_sort_mode_and_preserves_selected_session() {
+        let mut older_created = session(Agent::Codex, "Older created", "/work/one");
+        older_created.created = Utc.timestamp_opt(100, 0).unwrap();
+        older_created.updated = Utc.timestamp_opt(400, 0).unwrap();
+        let mut newer_created = session(Agent::Claude, "Newer created", "/work/two");
+        newer_created.created = Utc.timestamp_opt(300, 0).unwrap();
+        newer_created.updated = Utc.timestamp_opt(350, 0).unwrap();
+        let mut app = App::new(vec![older_created, newer_created], 0, SortMode::Updated);
+        let selected_id = app.selected().unwrap().id.clone();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+
+        assert_eq!(app.sort_mode, SortMode::Created);
+        assert_eq!(app.sessions[0].title, "Newer created");
+        assert_eq!(app.selected().unwrap().id, selected_id);
     }
 }

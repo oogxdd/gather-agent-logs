@@ -62,6 +62,7 @@ project.
 | `Ctrl+B`, `Ctrl+F`, `PgUp`, `PgDn` | Move a full page |
 | `H`, `M`, `L` | Select the top, middle, or bottom visible session |
 | `Ctrl+W`, `Tab`, `h` / `l` | Switch between sessions and details |
+| `s` | Toggle sorting by last update or creation time |
 | `/` | Fuzzy-search; `Tab` keeps the filter for navigation |
 | `Enter` | Resume the selected session, including while searching |
 | `Esc` | Clear an active search; otherwise quit |
@@ -77,6 +78,7 @@ work as expected.
 agent-resume [OPTIONS]
 
   --agent <all|codex|claude>  Limit the list to one agent
+  --sort <updated|created>     Choose the initial sort order
   --home <HOME_DIR>           Scan another home directory
   --codex-dir <SESSIONS_DIR>  Override the Codex sessions directory
   --claude-dir <PROJECTS_DIR> Override the Claude projects directory
@@ -87,18 +89,20 @@ For example:
 
 ```bash
 agent-resume --agent codex
+agent-resume --sort created
 agent-resume --list
 agent-resume --codex-dir /mnt/old-home/.codex/sessions
 ```
 
 ## How scanning stays light
 
-The program stores only small metadata records in memory. For each JSONL file,
-it reads at most the first 512 records and stops as soon as it has the session
-ID, working directory, first real user prompt, and the first assistant reply.
+The program stores only small metadata records in memory. It streams each JSONL
+file once to find the session creation timestamp and the timestamp of the last
+real user or assistant message. The transcript itself is never retained.
 Known injected context such as `AGENTS.md`, environment blocks, plugin hints,
 and Claude slash-command output is excluded from titles. Claude subagent logs
-are excluded from the top-level session list.
+are excluded from the top-level session list. File modification time is used
+only as a fallback for old or incomplete logs without message timestamps.
 
 The TUI keeps the metadata list but only renders the visible viewport. It does
 not load full transcripts and never modifies session files.
@@ -110,6 +114,9 @@ Check what the scanner sees without opening the TUI:
 ```bash
 agent-resume --list
 ```
+
+Plain output is tab-separated: agent, creation time, last-message time, session
+ID, working directory, and title. `--sort` applies to this output too.
 
 If no sessions are found, confirm the agent-specific directory and override it
 when necessary:
