@@ -1,4 +1,7 @@
+//! Finding agent log files on this machine and reading their metadata.
+
 use std::{
+    env,
     fs::{self, File},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -6,51 +9,179 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use serde_json::Value;
 
-use crate::model::{Agent, Session, clean_title};
+use crate::{
+    model::{Agent, Origin, Session},
+    transcript::SessionScanner,
+};
 
-#[derive(Debug)]
-pub struct DiscoveryOptions {
-    pub codex_dir: PathBuf,
-    pub claude_dir: PathBuf,
-    pub include_codex: bool,
-    pub include_claude: bool,
+/// One agent's log directory on this machine. Supporting another CLI is a
+/// matter of adding an entry here and teaching `transcript` its record shape.
+#[derive(Clone, Debug)]
+pub struct AgentSource {
+    pub agent: Agent,
+    pub root: PathBuf,
+    /// Claude Code stores subagent transcripts next to real sessions.
+    pub skip_subagents: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
+pub struct SourceOptions {
+    pub home: Option<PathBuf>,
+    /// A caller-provided home disables the agents' own environment overrides.
+    pub home_was_explicit: bool,
+    pub codex_dir: Option<PathBuf>,
+    pub claude_dir: Option<PathBuf>,
+}
+
+/// Resolves where each agent keeps its logs, honouring the agents' own
+/// environment variables unless an explicit directory was given.
+pub fn sources(options: &SourceOptions) -> Vec<AgentSource> {
+    let home = options
+        .home
+        .clone()
+        .or_else(|| env::var_os("HOME").map(PathBuf::from));
+    let explicit = options.home_was_explicit;
+
+    let codex_root = match options.codex_dir.clone() {
+        Some(directory) => directory,
+        None if !explicit => env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .map(|directory| directory.join("sessions"))
+            .unwrap_or_else(|| under_home(&home, ".codex/sessions")),
+        None => under_home(&home, ".codex/sessions"),
+    };
+    let claude_root = match options.claude_dir.clone() {
+        Some(directory) => directory,
+        None if !explicit => env::var_os("CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .map(|directory| directory.join("projects"))
+            .unwrap_or_else(|| under_home(&home, ".claude/projects")),
+        None => under_home(&home, ".claude/projects"),
+    };
+
+    vec![
+        AgentSource {
+            agent: Agent::Codex,
+            root: codex_root,
+            skip_subagents: false,
+        },
+        AgentSource {
+            agent: Agent::Claude,
+            root: claude_root,
+            skip_subagents: true,
+        },
+    ]
+}
+
+fn under_home(home: &Option<PathBuf>, relative: &str) -> PathBuf {
+    home.as_ref()
+        .map(|directory| directory.join(relative))
+        .unwrap_or_default()
+}
+
+#[derive(Clone, Debug)]
+pub struct LogFile {
+    pub agent: Agent,
+    pub path: PathBuf,
+    pub size: u64,
+    pub modified: DateTime<Utc>,
+    /// Session ID taken from the file name, when it carries one. Lets the
+    /// collector skip unchanged files without reading them.
+    pub id_hint: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct ScanResult {
+    pub files: Vec<LogFile>,
+    pub skipped: usize,
+}
+
+pub fn scan(sources: &[AgentSource]) -> ScanResult {
+    let mut result = ScanResult::default();
+    for source in sources {
+        let mut paths = jsonl_files(&source.root, source.skip_subagents, &mut result.skipped);
+        paths.sort_unstable();
+        for path in paths {
+            let Ok(metadata) = fs::metadata(&path) else {
+                result.skipped += 1;
+                continue;
+            };
+            let modified = metadata
+                .modified()
+                .map(DateTime::<Utc>::from)
+                .unwrap_or_else(|_| DateTime::<Utc>::from(UNIX_EPOCH));
+            result.files.push(LogFile {
+                agent: source.agent.clone(),
+                id_hint: session_id_from_path(&path),
+                path,
+                size: metadata.len(),
+                modified,
+            });
+        }
+    }
+    result
+}
+
+#[derive(Debug, Default)]
 pub struct DiscoveryResult {
     pub sessions: Vec<Session>,
     pub skipped: usize,
 }
 
-pub fn discover(options: &DiscoveryOptions) -> DiscoveryResult {
-    let mut sessions = Vec::new();
-    let mut skipped = 0;
+/// Reads every local session's metadata. Transcripts are never held in memory.
+pub fn discover(sources: &[AgentSource], host: &str) -> DiscoveryResult {
+    let scanned = scan(sources);
+    let mut result = DiscoveryResult {
+        sessions: Vec::new(),
+        skipped: scanned.skipped,
+    };
 
-    if options.include_codex {
-        let mut files = jsonl_files(&options.codex_dir, false, &mut skipped);
-        files.sort_unstable();
-        for path in files {
-            match parse_session_file(&path, Agent::Codex) {
-                Some(session) => sessions.push(session),
-                None => skipped += 1,
-            }
+    for file in scanned.files {
+        match read_session(&file, host) {
+            Some(session) => result.sessions.push(session),
+            None => result.skipped += 1,
         }
     }
+    result
+}
 
-    if options.include_claude {
-        let mut files = jsonl_files(&options.claude_dir, true, &mut skipped);
-        files.sort_unstable();
-        for path in files {
-            match parse_session_file(&path, Agent::Claude) {
-                Some(session) => sessions.push(session),
-                None => skipped += 1,
-            }
-        }
+pub fn read_session(file: &LogFile, host: &str) -> Option<Session> {
+    let handle = File::open(&file.path).ok()?;
+    read_session_from(BufReader::new(handle), file, host, file.modified)
+}
+
+fn read_session_from(
+    reader: impl BufRead,
+    file: &LogFile,
+    host: &str,
+    fallback: DateTime<Utc>,
+) -> Option<Session> {
+    let mut scanner = SessionScanner::new(&file.agent);
+    let mut messages = 0_u32;
+    for (index, line) in reader.lines().enumerate() {
+        let Ok(line) = line else { continue };
+        messages += scanner.push(index as i64, &line).len() as u32;
     }
 
-    DiscoveryResult { sessions, skipped }
+    let meta = scanner.into_meta();
+    let id = meta.id.or_else(|| session_id_from_path(&file.path))?;
+    Some(Session {
+        agent: file.agent.clone(),
+        host: host.to_owned(),
+        origin: Origin::Local,
+        title: meta
+            .title
+            .unwrap_or_else(|| format!("Untitled {} session", file.agent.label())),
+        cwd: meta.cwd.unwrap_or_default(),
+        path: file.path.clone(),
+        created: meta.created.unwrap_or(fallback),
+        updated: meta.updated.or(meta.created).unwrap_or(fallback),
+        remote_key: None,
+        bytes: file.size,
+        messages,
+        id,
+    })
 }
 
 fn jsonl_files(root: &Path, skip_subagents: bool, skipped: &mut usize) -> Vec<PathBuf> {
@@ -106,173 +237,8 @@ fn jsonl_files(root: &Path, skip_subagents: bool, skipped: &mut usize) -> Vec<Pa
     files
 }
 
-fn parse_session_file(path: &Path, agent: Agent) -> Option<Session> {
-    let file = File::open(path).ok()?;
-    let modified = fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .unwrap_or(UNIX_EPOCH);
-    let fallback_timestamp = DateTime::<Utc>::from(modified);
-    parse_reader(BufReader::new(file), path, fallback_timestamp, agent)
-}
-
-fn parse_reader(
-    reader: impl BufRead,
-    path: &Path,
-    fallback_timestamp: DateTime<Utc>,
-    agent: Agent,
-) -> Option<Session> {
-    match agent {
-        Agent::Codex => parse_codex(reader, path, fallback_timestamp),
-        Agent::Claude => parse_claude(reader, path, fallback_timestamp),
-    }
-}
-
-fn parse_codex(
-    reader: impl BufRead,
-    path: &Path,
-    fallback_timestamp: DateTime<Utc>,
-) -> Option<Session> {
-    let mut id = None;
-    let mut cwd = None;
-    let mut title = None;
-    let mut created = None;
-    let mut updated = None;
-
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        let Ok(record) = serde_json::from_str::<Value>(line.trim_start_matches('\0')) else {
-            continue;
-        };
-        let timestamp = timestamp_at(&record, "timestamp");
-        created = created.or(timestamp);
-
-        match record.get("type").and_then(Value::as_str) {
-            Some("session_meta") => {
-                let payload = &record["payload"];
-                id = string_at(payload, "id").or_else(|| string_at(payload, "session_id"));
-                cwd = string_at(payload, "cwd").map(PathBuf::from);
-                created = timestamp_at(payload, "timestamp").or(created);
-            }
-            Some("response_item") => {
-                let payload = &record["payload"];
-                if payload.get("type").and_then(Value::as_str) == Some("message") {
-                    let role = payload.get("role").and_then(Value::as_str);
-                    if matches!(role, Some("user" | "assistant")) {
-                        updated = timestamp.or(updated);
-                    }
-                    match role {
-                        Some("user") if title.is_none() => {
-                            title = content_title(&payload["content"]);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Some("event_msg") => {
-                let payload = &record["payload"];
-                let message_type = payload.get("type").and_then(Value::as_str);
-                if matches!(message_type, Some("user_message" | "agent_message")) {
-                    updated = timestamp.or(updated);
-                }
-                if title.is_none() && message_type == Some("user_message") {
-                    title = payload
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .and_then(clean_title);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let id = id.or_else(|| id_from_filename(path))?;
-    Some(Session {
-        agent: Agent::Codex,
-        id,
-        title: title.unwrap_or_else(|| "Untitled Codex session".to_owned()),
-        cwd: cwd.unwrap_or_default(),
-        path: path.to_path_buf(),
-        created: created.unwrap_or(fallback_timestamp),
-        updated: updated.or(created).unwrap_or(fallback_timestamp),
-    })
-}
-
-fn parse_claude(
-    reader: impl BufRead,
-    path: &Path,
-    fallback_timestamp: DateTime<Utc>,
-) -> Option<Session> {
-    let mut id = None;
-    let mut cwd = None;
-    let mut title = None;
-    let mut created = None;
-    let mut updated = None;
-
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        let Ok(record) = serde_json::from_str::<Value>(line.trim_start_matches('\0')) else {
-            continue;
-        };
-        let timestamp = timestamp_at(&record, "timestamp");
-        created = created.or(timestamp);
-
-        id = id.or_else(|| string_at(&record, "sessionId"));
-        cwd = cwd.or_else(|| string_at(&record, "cwd").map(PathBuf::from));
-
-        match record.get("type").and_then(Value::as_str) {
-            Some("custom-title") if title.is_none() => {
-                title = string_at(&record, "customTitle").and_then(|text| clean_title(&text));
-            }
-            Some("user") if title.is_none() => {
-                updated = timestamp.or(updated);
-                title = content_title(&record["message"]["content"]);
-            }
-            Some("user" | "assistant") => updated = timestamp.or(updated),
-            _ => {}
-        }
-    }
-
-    let id = id.or_else(|| id_from_filename(path))?;
-    Some(Session {
-        agent: Agent::Claude,
-        id,
-        title: title.unwrap_or_else(|| "Untitled Claude Code session".to_owned()),
-        cwd: cwd.unwrap_or_default(),
-        path: path.to_path_buf(),
-        created: created.unwrap_or(fallback_timestamp),
-        updated: updated.or(created).unwrap_or(fallback_timestamp),
-    })
-}
-
-fn content_title(content: &Value) -> Option<String> {
-    match content {
-        Value::String(text) => clean_title(text),
-        Value::Array(parts) => parts.iter().find_map(|part| {
-            let kind = part.get("type").and_then(Value::as_str);
-            if !matches!(kind, Some("text" | "input_text")) {
-                return None;
-            }
-            part.get("text")
-                .and_then(Value::as_str)
-                .and_then(clean_title)
-        }),
-        _ => None,
-    }
-}
-
-fn string_at(value: &Value, key: &str) -> Option<String> {
-    value.get(key).and_then(Value::as_str).map(str::to_owned)
-}
-
-fn timestamp_at(value: &Value, key: &str) -> Option<DateTime<Utc>> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-}
-
-fn id_from_filename(path: &Path) -> Option<String> {
+/// Both agents end their file names with the session UUID.
+pub fn session_id_from_path(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     let candidate = stem.get(stem.len().saturating_sub(36)..)?;
     let looks_like_uuid = candidate.len() == 36
@@ -288,79 +254,70 @@ fn id_from_filename(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Cursor, path::Path};
+    use std::{io::Cursor, path::PathBuf};
 
     use chrono::{TimeZone, Utc};
 
-    use super::{Agent, parse_reader};
+    use super::{Agent, LogFile, read_session_from, session_id_from_path};
 
-    fn fallback_timestamp() -> chrono::DateTime<Utc> {
-        Utc.timestamp_opt(1_700_000_000, 0).unwrap()
-    }
-
-    fn timestamp(value: &str) -> chrono::DateTime<Utc> {
-        chrono::DateTime::parse_from_rfc3339(value)
-            .unwrap()
-            .with_timezone(&Utc)
+    fn log_file(agent: Agent, path: &str) -> LogFile {
+        LogFile {
+            agent,
+            path: PathBuf::from(path),
+            size: 0,
+            modified: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            id_hint: session_id_from_path(&PathBuf::from(path)),
+        }
     }
 
     #[test]
-    fn parses_codex_metadata_and_skips_injected_user_context() {
+    fn reads_codex_session_metadata() {
         let input = concat!(
             r#"{"timestamp":"2026-01-01T10:00:00Z","type":"session_meta","payload":{"id":"019ff21e-4824-70d2-8cb6-57e5b1aebefb","cwd":"/work/repo","timestamp":"2026-01-01T10:00:00Z"}}"#,
             "\n",
-            r##"{"timestamp":"2026-01-01T10:01:00Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"internal"}]}}"##,
-            "\n",
-            r##"{"timestamp":"2026-01-01T10:02:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions\ninternal"}]}}"##,
-            "\n",
             r#"{"timestamp":"2026-01-01T10:03:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Fix the auth race"}]}}"#,
             "\n",
-            r#"{"timestamp":"2026-01-01T10:04:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}"#,
-            "\n",
-            r#"{"timestamp":"2026-01-01T10:05:00Z","type":"response_item","payload":{"type":"custom_tool_call"}}"#,
+            r#"{"timestamp":"2026-01-01T10:04:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}"#,
             "\n"
         );
+        let file = log_file(Agent::Codex, "rollout.jsonl");
 
-        let session = parse_reader(
+        let session = read_session_from(
             Cursor::new(input),
-            Path::new("rollout.jsonl"),
-            fallback_timestamp(),
-            Agent::Codex,
+            &file,
+            "laptop",
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
         )
         .unwrap();
 
         assert_eq!(session.id, "019ff21e-4824-70d2-8cb6-57e5b1aebefb");
-        assert_eq!(session.cwd, Path::new("/work/repo"));
+        assert_eq!(session.host, "laptop");
         assert_eq!(session.title, "Fix the auth race");
-        assert_eq!(session.created, timestamp("2026-01-01T10:00:00Z"));
-        assert_eq!(session.updated, timestamp("2026-01-01T10:04:00Z"));
+        assert_eq!(session.messages, 2);
+        assert_eq!(session.cwd, PathBuf::from("/work/repo"));
     }
 
     #[test]
-    fn parses_claude_string_content() {
-        let input = concat!(
-            r#"{"type":"queue-operation","timestamp":"2026-02-01T10:00:00Z","sessionId":"86e1a7f3-2e99-483f-b743-64e0003c58c8"}"#,
-            "\n",
-            r#"{"type":"user","timestamp":"2026-02-01T10:01:00Z","sessionId":"86e1a7f3-2e99-483f-b743-64e0003c58c8","cwd":"/work/repo","message":{"role":"user","content":"Ship the CLI"}}"#,
-            "\n",
-            r#"{"type":"assistant","timestamp":"2026-02-01T10:03:00Z","sessionId":"86e1a7f3-2e99-483f-b743-64e0003c58c8","cwd":"/work/repo","message":{"role":"assistant","content":"Done"}}"#,
-            "\n",
-            r#"{"type":"last-prompt","timestamp":"2026-02-01T10:05:00Z","sessionId":"86e1a7f3-2e99-483f-b743-64e0003c58c8"}"#,
-            "\n"
+    fn falls_back_to_the_session_id_in_the_file_name() {
+        let file = log_file(
+            Agent::Claude,
+            "/logs/86e1a7f3-2e99-483f-b743-64e0003c58c8.jsonl",
         );
 
-        let session = parse_reader(
-            Cursor::new(input),
-            Path::new("86e1a7f3-2e99-483f-b743-64e0003c58c8.jsonl"),
-            fallback_timestamp(),
-            Agent::Claude,
+        let session = read_session_from(
+            Cursor::new("{}\n"),
+            &file,
+            "laptop",
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
         )
         .unwrap();
 
         assert_eq!(session.id, "86e1a7f3-2e99-483f-b743-64e0003c58c8");
-        assert_eq!(session.cwd, Path::new("/work/repo"));
-        assert_eq!(session.title, "Ship the CLI");
-        assert_eq!(session.created, timestamp("2026-02-01T10:00:00Z"));
-        assert_eq!(session.updated, timestamp("2026-02-01T10:03:00Z"));
+        assert_eq!(session.title, "Untitled Claude session");
+    }
+
+    #[test]
+    fn ignores_file_names_without_a_session_id() {
+        assert!(session_id_from_path(&PathBuf::from("/logs/history.jsonl")).is_none());
     }
 }

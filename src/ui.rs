@@ -23,12 +23,22 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
 };
 
-use crate::model::{Agent, Session, SortMode, sort_sessions};
+use crate::{
+    model::{Agent, Origin, Session, SortMode, sort_sessions},
+    transcript::{Role, read_transcript},
+};
+
+/// Supplies a session's stored records when the reader is opened. Sessions from
+/// another machine come from the database; local ones come from disk.
+pub trait TranscriptLoader {
+    fn load(&mut self, session: &Session) -> Result<Vec<u8>>;
+}
 
 pub fn pick(
     sessions: Vec<Session>,
     skipped: usize,
     sort_mode: SortMode,
+    loader: &mut dyn TranscriptLoader,
 ) -> Result<Option<Session>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -46,7 +56,7 @@ pub fn pick(
         }
     };
 
-    let result = run_picker(&mut terminal, sessions, skipped, sort_mode);
+    let result = run_picker(&mut terminal, sessions, skipped, sort_mode, loader);
 
     let raw_mode_result = disable_raw_mode();
     let screen_result = execute!(terminal.backend_mut(), LeaveAlternateScreen);
@@ -63,6 +73,7 @@ fn run_picker(
     sessions: Vec<Session>,
     skipped: usize,
     sort_mode: SortMode,
+    loader: &mut dyn TranscriptLoader,
 ) -> Result<Option<Session>> {
     let mut app = App::new(sessions, skipped, sort_mode);
 
@@ -82,6 +93,11 @@ fn run_picker(
             Action::Continue => {}
             Action::Quit => return Ok(None),
             Action::Resume => return Ok(app.selected().cloned()),
+            Action::View => {
+                if let Some(session) = app.selected().cloned() {
+                    app.open_reader(&session, loader);
+                }
+            }
         }
     }
 }
@@ -90,6 +106,7 @@ fn run_picker(
 enum Mode {
     Browse,
     Search,
+    Reader,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +120,15 @@ enum Action {
     Continue,
     Quit,
     Resume,
+    View,
+}
+
+/// A transcript opened for reading inside the picker.
+struct Reader {
+    title: String,
+    lines: Vec<Line<'static>>,
+    scroll: u16,
+    max_scroll: u16,
 }
 
 struct App {
@@ -113,12 +139,15 @@ struct App {
     mode: Mode,
     focus: Focus,
     sort_mode: SortMode,
+    /// Set when sessions come from more than one machine.
+    show_host: bool,
     pending_g: bool,
     selected_position: Option<usize>,
     scroll_offset: usize,
     list_viewport_height: usize,
     details_scroll: u16,
     details_max_scroll: u16,
+    reader: Option<Reader>,
     skipped: usize,
 }
 
@@ -127,6 +156,15 @@ impl App {
         let searchable = sessions.iter().map(Session::searchable_text).collect();
         let filtered = (0..sessions.len()).collect();
         let selected_position = (!sessions.is_empty()).then_some(0);
+        let show_host = sessions
+            .iter()
+            .any(|session| session.origin == Origin::Remote)
+            || sessions
+                .iter()
+                .map(|session| session.host.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1;
         Self {
             sessions,
             filtered,
@@ -135,12 +173,14 @@ impl App {
             mode: Mode::Browse,
             focus: Focus::Sessions,
             sort_mode,
+            show_host,
             pending_g: false,
             selected_position,
             scroll_offset: 0,
             list_viewport_height: 10,
             details_scroll: 0,
             details_max_scroll: 0,
+            reader: None,
             skipped,
         }
     }
@@ -152,10 +192,33 @@ impl App {
             .and_then(|index| self.sessions.get(*index))
     }
 
+    fn open_reader(&mut self, session: &Session, loader: &mut dyn TranscriptLoader) {
+        let lines = match loader.load(session) {
+            Ok(jsonl) => transcript_lines(&session.agent, &jsonl),
+            Err(error) => vec![Line::from(Span::styled(
+                format!("{error:#}"),
+                Style::default().fg(Color::Red),
+            ))],
+        };
+        self.reader = Some(Reader {
+            title: format!(
+                "{} · {} · {}",
+                session.host,
+                session.agent.label(),
+                session.title
+            ),
+            lines,
+            scroll: 0,
+            max_scroll: 0,
+        });
+        self.mode = Mode::Reader;
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Action {
         match self.mode {
             Mode::Search => self.handle_search_key(key),
             Mode::Browse => self.handle_browse_key(key),
+            Mode::Reader => self.handle_reader_key(key),
         }
     }
 
@@ -166,7 +229,7 @@ impl App {
                 self.mode = Mode::Browse;
                 self.refilter();
             }
-            KeyCode::Enter if !self.filtered.is_empty() => return Action::Resume,
+            KeyCode::Enter if !self.filtered.is_empty() => return self.open_selected(),
             KeyCode::Tab | KeyCode::BackTab => {
                 self.mode = Mode::Browse;
                 self.focus = Focus::Sessions;
@@ -185,6 +248,56 @@ impl App {
             }
             _ => {}
         }
+        Action::Continue
+    }
+
+    fn handle_reader_key(&mut self, key: KeyEvent) -> Action {
+        let Some(reader) = self.reader.as_mut() else {
+            self.mode = Mode::Browse;
+            return Action::Continue;
+        };
+
+        if key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
+            if self.pending_g {
+                self.pending_g = false;
+                reader.scroll = 0;
+            } else {
+                self.pending_g = true;
+            }
+            return Action::Continue;
+        }
+        self.pending_g = false;
+
+        let page = 20_i32;
+        let step = match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::Browse;
+                self.reader = None;
+                return Action::Continue;
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => page / 2,
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => -page / 2,
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => page,
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => -page,
+            KeyCode::Down | KeyCode::Char('j') => 1,
+            KeyCode::Up | KeyCode::Char('k') => -1,
+            KeyCode::PageDown => page,
+            KeyCode::PageUp => -page,
+            KeyCode::Home => {
+                reader.scroll = 0;
+                return Action::Continue;
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                reader.scroll = reader.max_scroll;
+                return Action::Continue;
+            }
+            _ => return Action::Continue,
+        };
+
+        reader.scroll = reader
+            .scroll
+            .saturating_add_signed(step.clamp(i16::MIN as i32, i16::MAX as i32) as i16)
+            .min(reader.max_scroll);
         Action::Continue
     }
 
@@ -232,7 +345,8 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
-            KeyCode::Enter if !self.filtered.is_empty() => Action::Resume,
+            KeyCode::Enter if !self.filtered.is_empty() => self.open_selected(),
+            KeyCode::Char('v') if !self.filtered.is_empty() => Action::View,
             KeyCode::Char('/') => {
                 self.mode = Mode::Search;
                 Action::Continue
@@ -301,6 +415,16 @@ impl App {
                 Action::Continue
             }
             _ => Action::Continue,
+        }
+    }
+
+    /// Enter resumes what can be resumed, and reads what cannot: a session
+    /// recorded on another machine has no local process to return to.
+    fn open_selected(&self) -> Action {
+        match self.selected() {
+            Some(session) if session.origin.is_local() => Action::Resume,
+            Some(_) => Action::View,
+            None => Action::Continue,
         }
     }
 
@@ -431,7 +555,52 @@ impl App {
     }
 }
 
+/// Formats a stored transcript for reading, keeping the reasoning and tool
+/// traffic visually subordinate to the conversation.
+fn transcript_lines(agent: &Agent, jsonl: &[u8]) -> Vec<Line<'static>> {
+    let entries = read_transcript(agent, jsonl);
+    if entries.is_empty() {
+        return vec![Line::from("No readable messages in this transcript.")];
+    }
+
+    let mut lines = Vec::new();
+    for entry in entries {
+        let (label, color) = match entry.role {
+            Role::User => ("user", Color::Green),
+            Role::Assistant => ("assistant", Color::Cyan),
+            Role::Reasoning => ("thinking", Color::DarkGray),
+            Role::Tool => ("tool", Color::Yellow),
+        };
+        let time = entry
+            .timestamp
+            .map(|timestamp| timestamp.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{label} "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(time, Style::default().fg(Color::DarkGray)),
+        ]));
+        let body_style = if entry.role == Role::User {
+            Style::default()
+        } else {
+            Style::default().fg(color)
+        };
+        for line in entry.text.lines() {
+            lines.push(Line::from(Span::styled(line.to_owned(), body_style)));
+        }
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
 fn render(frame: &mut Frame<'_>, app: &mut App) {
+    if app.mode == Mode::Reader {
+        render_reader(frame, app);
+        return;
+    }
+
     let page = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -460,15 +629,61 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     let help = if app.mode == Mode::Search {
-        "type to filter  Enter resume  Tab keep filter  Esc clear"
+        "type to filter  Enter open  Tab keep filter  Esc clear"
     } else if app.focus == Focus::Details {
-        "DETAILS  j/k scroll  gg/G ends  Ctrl+d/u page  Ctrl+w/h pane  s sort  Enter resume  q quit"
+        "DETAILS  j/k scroll  gg/G ends  Ctrl+d/u page  Ctrl+w/h pane  s sort  v read  q quit"
     } else {
-        "SESSIONS  j/k move  gg/G ends  Ctrl+d/u page  Ctrl+w/l pane  s sort  / search  Enter resume"
+        "SESSIONS  j/k move  Ctrl+d/u page  Ctrl+w/l pane  s sort  / search  v read  Enter open"
     };
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
         page[2],
+    );
+}
+
+fn render_reader(frame: &mut Frame<'_>, app: &mut App) {
+    let page = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(frame.area());
+
+    let Some(reader) = app.reader.as_mut() else {
+        return;
+    };
+    let content_width = page[0].width.saturating_sub(2).max(1) as usize;
+    let visible_height = page[0].height.saturating_sub(2) as usize;
+    let wrapped_height: usize = reader
+        .lines
+        .iter()
+        .map(|line| line.width().div_ceil(content_width).max(1))
+        .sum();
+    reader.max_scroll = wrapped_height
+        .saturating_sub(visible_height)
+        .min(u16::MAX as usize) as u16;
+    reader.scroll = reader.scroll.min(reader.max_scroll);
+
+    let position = if reader.max_scroll == 0 {
+        " all ".to_owned()
+    } else {
+        format!(
+            " {}% ",
+            100 * u32::from(reader.scroll) / u32::from(reader.max_scroll)
+        )
+    };
+    let paragraph = Paragraph::new(reader.lines.clone())
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title(format!(" {} ", truncate(&reader.title, content_width)))
+                .title_bottom(Line::from(position).right_aligned())
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+    frame.render_widget(paragraph.scroll((reader.scroll, 0)), page[0]);
+    frame.render_widget(
+        Paragraph::new("TRANSCRIPT  j/k scroll  Ctrl+d/u page  gg/G ends  q back")
+            .style(Style::default().fg(Color::DarkGray)),
+        page[1],
     );
 }
 
@@ -486,7 +701,7 @@ fn render_search(frame: &mut Frame<'_>, app: &App, area: Rect) {
     };
     let query = if app.query.is_empty() && app.mode == Mode::Browse {
         Line::from(Span::styled(
-            "Press / to search title, project, path, or session ID",
+            "Press / to search machine, title, project, path, or session ID",
             Style::default().fg(Color::DarkGray),
         ))
     } else {
@@ -518,38 +733,56 @@ fn render_sessions(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.ensure_selection_is_visible(viewport_height);
     let start = app.scroll_offset;
     let end = (start + viewport_height).min(app.filtered.len());
+    let show_host = app.show_host;
     let rows = app.filtered[start..end].iter().map(|index| {
         let session = &app.sessions[*index];
         let agent_style = match session.agent {
             Agent::Codex => Style::default().fg(Color::Cyan),
             Agent::Claude => Style::default().fg(Color::Magenta),
+            Agent::Other(_) => Style::default().fg(Color::Blue),
         };
-        Row::new([
-            Cell::from(session.agent.label()).style(agent_style),
+        let host_style = if session.origin.is_local() {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let mut cells = Vec::with_capacity(5);
+        if show_host {
+            cells.push(Cell::from(session.host.clone()).style(host_style));
+        }
+        cells.extend([
+            Cell::from(session.agent.label().to_owned()).style(agent_style),
             Cell::from(age(app.sort_mode.timestamp(session))),
             Cell::from(session.project()),
             Cell::from(session.title.clone()),
-        ])
+        ]);
+        Row::new(cells)
     });
-    let widths = [
+
+    let mut widths = Vec::with_capacity(5);
+    let mut headers = Vec::with_capacity(5);
+    if show_host {
+        widths.push(Constraint::Length(14));
+        headers.push("Machine");
+    }
+    widths.extend([
         Constraint::Length(7),
         Constraint::Length(9),
-        Constraint::Length(22),
+        Constraint::Length(20),
         Constraint::Min(18),
-    ];
+    ]);
+    headers.extend([
+        "Agent",
+        match app.sort_mode {
+            SortMode::Created => "Created",
+            SortMode::Updated => "Updated",
+        },
+        "Project",
+        "First prompt",
+    ]);
+
     let table = Table::new(rows, widths)
-        .header(
-            Row::new([
-                "Agent",
-                match app.sort_mode {
-                    SortMode::Created => "Created",
-                    SortMode::Updated => "Updated",
-                },
-                "Project",
-                "First prompt",
-            ])
-            .style(Style::default().fg(Color::DarkGray)),
-        )
+        .header(Row::new(headers).style(Style::default().fg(Color::DarkGray)))
         .block(
             Block::default()
                 .title(" Sessions ")
@@ -575,10 +808,23 @@ fn render_sessions(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
 fn render_details(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let lines = if let Some(session) = app.selected() {
+        let origin = if session.origin.is_local() {
+            "local log".to_owned()
+        } else {
+            format!("collected from {}", session.host)
+        };
         vec![
             Line::from(vec![
+                Span::styled("Machine ", Style::default().fg(Color::DarkGray)),
+                Span::raw(session.host.clone()),
+            ]),
+            Line::from(vec![
                 Span::styled("Agent   ", Style::default().fg(Color::DarkGray)),
-                Span::raw(session.agent.label()),
+                Span::raw(session.agent.label().to_owned()),
+            ]),
+            Line::from(vec![
+                Span::styled("Source  ", Style::default().fg(Color::DarkGray)),
+                Span::raw(origin),
             ]),
             Line::from(vec![
                 Span::styled("Created ", Style::default().fg(Color::DarkGray)),
@@ -641,6 +887,15 @@ fn focus_style(focused: bool) -> Style {
     }
 }
 
+fn truncate(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    let mut result: String = text.chars().take(width.saturating_sub(1)).collect();
+    result.push('…');
+    result
+}
+
 fn age(timestamp: chrono::DateTime<Utc>) -> String {
     let duration = Utc::now().signed_duration_since(timestamp);
     if duration.num_seconds() < 60 {
@@ -660,22 +915,44 @@ fn age(timestamp: chrono::DateTime<Utc>) -> String {
 mod tests {
     use std::path::PathBuf;
 
+    use anyhow::Result;
     use chrono::{TimeZone, Utc};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::{Action, App, Focus, Mode};
-    use crate::model::{Agent, Session, SortMode};
+    use super::{Action, App, Focus, Mode, TranscriptLoader};
+    use crate::model::{Agent, Origin, Session, SortMode};
+
+    struct StaticLoader(&'static str);
+
+    impl TranscriptLoader for StaticLoader {
+        fn load(&mut self, _session: &Session) -> Result<Vec<u8>> {
+            Ok(self.0.as_bytes().to_vec())
+        }
+    }
 
     fn session(agent: Agent, title: &str, cwd: &str) -> Session {
         Session {
             agent,
+            host: "laptop".to_owned(),
+            origin: Origin::Local,
             id: format!("{title}-id"),
             title: title.to_owned(),
             cwd: PathBuf::from(cwd),
             path: PathBuf::from("session.jsonl"),
             created: Utc.timestamp_opt(1_600_000_000, 0).unwrap(),
             updated: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            remote_key: None,
+            bytes: 0,
+            messages: 0,
         }
+    }
+
+    fn collected(agent: Agent, title: &str, host: &str) -> Session {
+        let mut session = session(agent, title, "/work/remote");
+        session.origin = Origin::Remote;
+        session.host = host.to_owned();
+        session.remote_key = Some(1);
+        session
     }
 
     #[test]
@@ -690,6 +967,24 @@ mod tests {
         app.refilter();
 
         assert_eq!(app.filtered, vec![1]);
+    }
+
+    #[test]
+    fn fuzzy_filter_matches_the_machine_name() {
+        let sessions = vec![
+            session(Agent::Codex, "Local work", "/work/backend"),
+            collected(Agent::Claude, "Sandbox work", "sandbox-7"),
+        ];
+        let mut app = App::new(sessions, 0, SortMode::Updated);
+
+        app.query = "sandbox".to_owned();
+        app.refilter();
+
+        assert_eq!(app.filtered, vec![1]);
+        assert!(
+            app.show_host,
+            "the machine column appears once hosts differ"
+        );
     }
 
     #[test]
@@ -759,17 +1054,60 @@ mod tests {
     }
 
     #[test]
-    fn enter_resumes_directly_from_search() {
+    fn enter_resumes_local_sessions_and_reads_collected_ones() {
         let mut app = App::new(
             vec![session(Agent::Claude, "Session", "/work/project")],
             0,
             SortMode::Updated,
         );
         app.mode = Mode::Search;
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::Resume
+        );
 
-        let action = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let mut app = App::new(
+            vec![collected(Agent::Claude, "Session", "sandbox-7")],
+            0,
+            SortMode::Updated,
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::View,
+            "a session from another machine has nothing to resume into"
+        );
+    }
 
-        assert_eq!(action, Action::Resume);
+    #[test]
+    fn the_reader_opens_scrolls_and_closes() {
+        let mut app = App::new(
+            vec![collected(Agent::Claude, "Session", "sandbox-7")],
+            0,
+            SortMode::Updated,
+        );
+        let selected = app.selected().cloned().unwrap();
+        let mut loader = StaticLoader(
+            r#"{"type":"user","timestamp":"2026-02-01T10:01:00Z","message":{"role":"user","content":"hello"}}"#,
+        );
+
+        app.open_reader(&selected, &mut loader);
+        assert_eq!(app.mode, Mode::Reader);
+        let reader = app.reader.as_mut().unwrap();
+        reader.max_scroll = 10;
+        assert!(
+            reader
+                .lines
+                .iter()
+                .any(|line| line.spans.iter().any(|span| span.content.contains("hello"))),
+            "the transcript body is rendered"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.reader.as_ref().unwrap().scroll, 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.reader.is_none());
     }
 
     #[test]
