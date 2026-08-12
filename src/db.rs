@@ -21,6 +21,11 @@ use crate::{
 
 pub const SCHEMA_VERSION: i32 = 1;
 
+/// Seconds to wait for a connection before giving up.
+pub const DEFAULT_CONNECT_TIMEOUT: u32 = 10;
+/// Shorter bound for uploads triggered from inside an agent.
+pub const HOOK_CONNECT_TIMEOUT: u32 = 5;
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS agent_logs_meta (
     key   text PRIMARY KEY,
@@ -176,10 +181,18 @@ impl Store {
     /// Connects with TLS when the server offers it. Managed Postgres providers
     /// require it; a local development server usually has it switched off.
     pub fn connect(url: &str) -> Result<Self> {
-        let client = if wants_tls(url) {
-            Client::connect(url, tls_connector()?)
+        Self::connect_with_timeout(url, DEFAULT_CONNECT_TIMEOUT)
+    }
+
+    /// A connection attempt is always bounded. Agent hooks call this on a
+    /// machine that may be offline, and an unbounded TCP connect would stall
+    /// the agent for minutes rather than skipping one upload.
+    pub fn connect_with_timeout(url: &str, seconds: u32) -> Result<Self> {
+        let url = with_connect_timeout(url, seconds);
+        let client = if wants_tls(&url) {
+            Client::connect(&url, tls_connector()?)
         } else {
-            Client::connect(url, NoTls)
+            Client::connect(&url, NoTls)
         }
         .context("could not connect to the agent-logs database")?;
         Ok(Self { client })
@@ -680,6 +693,19 @@ fn wants_tls(url: &str) -> bool {
     !lowercase.contains("sslmode=disable")
 }
 
+/// Adds a connection timeout unless the caller already chose one. Both the URL
+/// and the `key=value` connection formats are accepted by Postgres clients.
+fn with_connect_timeout(url: &str, seconds: u32) -> String {
+    if url.contains("connect_timeout") {
+        return url.to_owned();
+    }
+    if !url.contains("://") {
+        return format!("{url} connect_timeout={seconds}");
+    }
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}connect_timeout={seconds}")
+}
+
 fn tls_connector() -> Result<MakeRustlsConnect> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -694,7 +720,27 @@ fn tls_connector() -> Result<MakeRustlsConnect> {
 
 #[cfg(test)]
 mod tests {
-    use super::{snippet_around, wants_tls};
+    use super::{snippet_around, wants_tls, with_connect_timeout};
+
+    #[test]
+    fn a_connection_is_always_bounded_but_never_overridden() {
+        assert_eq!(
+            with_connect_timeout("postgres://db.example.com/agent", 5),
+            "postgres://db.example.com/agent?connect_timeout=5"
+        );
+        assert_eq!(
+            with_connect_timeout("postgres://db.example.com/agent?sslmode=require", 5),
+            "postgres://db.example.com/agent?sslmode=require&connect_timeout=5"
+        );
+        assert_eq!(
+            with_connect_timeout("host=/var/run/postgresql dbname=agent", 5),
+            "host=/var/run/postgresql dbname=agent connect_timeout=5"
+        );
+        assert_eq!(
+            with_connect_timeout("postgres://db/agent?connect_timeout=30", 5),
+            "postgres://db/agent?connect_timeout=30"
+        );
+    }
 
     #[test]
     fn snippets_mark_the_match_case_insensitively() {
@@ -711,7 +757,10 @@ mod tests {
 
         let snippet = snippet_around(&body, "needle");
 
-        assert!(snippet.starts_with('…') && snippet.ends_with('…'), "{snippet}");
+        assert!(
+            snippet.starts_with('…') && snippet.ends_with('…'),
+            "{snippet}"
+        );
         assert!(snippet.contains("«needle»"));
         assert!(snippet.chars().count() < 200);
     }

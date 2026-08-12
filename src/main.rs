@@ -16,7 +16,7 @@ use agent_logs::{
     db::{SessionFilter, Store},
     discovery::{self, SourceOptions},
     model::{Agent, Origin, Session, SortMode, sort_sessions},
-    ui::{self, TranscriptLoader},
+    ui::{self, Backend, SearchMatch},
 };
 
 #[derive(Debug, Parser)]
@@ -195,8 +195,11 @@ fn run() -> Result<u8> {
         bail!("no sessions found");
     }
 
-    let mut loader = Loader { store };
-    let selection = ui::pick(sessions, skipped, sort_mode, &mut loader)?;
+    let mut library = Library {
+        store,
+        search_limit: cli.limit,
+    };
+    let selection = ui::pick(sessions, skipped, sort_mode, &mut library)?;
     let Some(session) = selection else {
         return Ok(0);
     };
@@ -204,13 +207,15 @@ fn run() -> Result<u8> {
     resume(&session)
 }
 
-/// Reads a transcript from wherever the selected session lives.
-struct Loader {
+/// Serves the picker: transcripts from disk or the database, and full-text
+/// search across everything collected.
+struct Library {
     store: Option<Store>,
+    search_limit: i64,
 }
 
-impl TranscriptLoader for Loader {
-    fn load(&mut self, session: &Session) -> Result<Vec<u8>> {
+impl Backend for Library {
+    fn transcript(&mut self, session: &Session) -> Result<Vec<u8>> {
         if session.origin.is_local() {
             return std::fs::read(&session.path)
                 .with_context(|| format!("could not read {}", session.path.display()));
@@ -227,6 +232,28 @@ impl TranscriptLoader for Loader {
             bail!("no transcript stored for this session; it may have been pruned");
         }
         Ok(jsonl)
+    }
+
+    fn search_messages(&mut self, query: &str) -> Result<Vec<SearchMatch>> {
+        let store = self.store.as_mut().context(
+            "searching inside conversations needs the collected database; none is configured",
+        )?;
+        let hits = store.search(
+            query,
+            &SessionFilter {
+                limit: self.search_limit,
+                ..SessionFilter::default()
+            },
+        )?;
+        Ok(hits
+            .into_iter()
+            .map(|hit| SearchMatch {
+                host: hit.session.host,
+                agent: hit.session.agent.key().to_owned(),
+                session_id: hit.session.id,
+                snippet: hit.snippet,
+            })
+            .collect())
     }
 }
 

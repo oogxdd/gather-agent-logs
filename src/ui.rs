@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{self, Stdout},
     time::Duration,
 };
@@ -28,17 +29,31 @@ use crate::{
     transcript::{Role, read_transcript},
 };
 
-/// Supplies a session's stored records when the reader is opened. Sessions from
-/// another machine come from the database; local ones come from disk.
-pub trait TranscriptLoader {
-    fn load(&mut self, session: &Session) -> Result<Vec<u8>>;
+/// Everything the picker needs that lives outside it: a session's records when
+/// the reader is opened, and a search across collected conversations.
+pub trait Backend {
+    /// Sessions from another machine come from the database; local ones come
+    /// from disk.
+    fn transcript(&mut self, session: &Session) -> Result<Vec<u8>>;
+
+    /// Finds sessions by what was said in them, not just by their metadata.
+    fn search_messages(&mut self, query: &str) -> Result<Vec<SearchMatch>>;
+}
+
+/// One collected message that matched a content search.
+#[derive(Clone, Debug)]
+pub struct SearchMatch {
+    pub host: String,
+    pub agent: String,
+    pub session_id: String,
+    pub snippet: String,
 }
 
 pub fn pick(
     sessions: Vec<Session>,
     skipped: usize,
     sort_mode: SortMode,
-    loader: &mut dyn TranscriptLoader,
+    backend: &mut dyn Backend,
 ) -> Result<Option<Session>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -46,8 +61,7 @@ pub fn pick(
         let _ = disable_raw_mode();
         return Err(error.into());
     }
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = match Terminal::new(backend) {
+    let mut terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
         Ok(terminal) => terminal,
         Err(error) => {
             let _ = disable_raw_mode();
@@ -56,7 +70,7 @@ pub fn pick(
         }
     };
 
-    let result = run_picker(&mut terminal, sessions, skipped, sort_mode, loader);
+    let result = run_picker(&mut terminal, sessions, skipped, sort_mode, backend);
 
     let raw_mode_result = disable_raw_mode();
     let screen_result = execute!(terminal.backend_mut(), LeaveAlternateScreen);
@@ -73,7 +87,7 @@ fn run_picker(
     sessions: Vec<Session>,
     skipped: usize,
     sort_mode: SortMode,
-    loader: &mut dyn TranscriptLoader,
+    backend: &mut dyn Backend,
 ) -> Result<Option<Session>> {
     let mut app = App::new(sessions, skipped, sort_mode);
 
@@ -95,9 +109,10 @@ fn run_picker(
             Action::Resume => return Ok(app.selected().cloned()),
             Action::View => {
                 if let Some(session) = app.selected().cloned() {
-                    app.open_reader(&session, loader);
+                    app.open_reader(&session, backend);
                 }
             }
+            Action::SearchContent => app.run_content_search(backend),
         }
     }
 }
@@ -105,7 +120,10 @@ fn run_picker(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
     Browse,
+    /// Fuzzy filter over what is already loaded.
     Search,
+    /// Full-text query against the collected conversations.
+    ContentSearch,
     Reader,
 }
 
@@ -121,6 +139,18 @@ enum Action {
     Quit,
     Resume,
     View,
+    SearchContent,
+}
+
+/// The result of searching inside conversations: which sessions matched, and
+/// the line that matched in each.
+#[derive(Debug, Default)]
+struct ContentFilter {
+    query: String,
+    snippets: HashMap<(String, String, String), String>,
+    /// Matches in sessions that are not in the loaded list.
+    elsewhere: usize,
+    error: Option<String>,
 }
 
 /// A transcript opened for reading inside the picker.
@@ -148,6 +178,7 @@ struct App {
     details_scroll: u16,
     details_max_scroll: u16,
     reader: Option<Reader>,
+    content: Option<ContentFilter>,
     skipped: usize,
 }
 
@@ -181,6 +212,7 @@ impl App {
             details_scroll: 0,
             details_max_scroll: 0,
             reader: None,
+            content: None,
             skipped,
         }
     }
@@ -192,8 +224,8 @@ impl App {
             .and_then(|index| self.sessions.get(*index))
     }
 
-    fn open_reader(&mut self, session: &Session, loader: &mut dyn TranscriptLoader) {
-        let lines = match loader.load(session) {
+    fn open_reader(&mut self, session: &Session, backend: &mut dyn Backend) {
+        let lines = match backend.transcript(session) {
             Ok(jsonl) => transcript_lines(&session.agent, &jsonl),
             Err(error) => vec![Line::from(Span::styled(
                 format!("{error:#}"),
@@ -214,12 +246,91 @@ impl App {
         self.mode = Mode::Reader;
     }
 
+    /// Restricts the list to sessions that said something matching the query.
+    /// Matches in sessions outside the loaded list are counted, not hidden.
+    fn run_content_search(&mut self, backend: &mut dyn Backend) {
+        let Some(content) = self.content.as_mut() else {
+            return;
+        };
+        let query = content.query.clone();
+        if query.trim().is_empty() {
+            self.content = None;
+            self.refilter();
+            return;
+        }
+
+        let known: std::collections::HashSet<_> = self
+            .sessions
+            .iter()
+            .map(|session| session.dedup_key())
+            .collect();
+        match backend.search_messages(&query) {
+            Ok(matches) => {
+                content.error = None;
+                content.snippets.clear();
+                content.elsewhere = 0;
+                for found in matches {
+                    let key = (found.host, found.agent, found.session_id);
+                    if !known.contains(&key) {
+                        content.elsewhere += 1;
+                        continue;
+                    }
+                    content.snippets.entry(key).or_insert(found.snippet);
+                }
+            }
+            Err(error) => {
+                content.error = Some(format!("{error:#}"));
+                content.snippets.clear();
+            }
+        }
+        self.mode = Mode::Browse;
+        self.focus = Focus::Sessions;
+        self.refilter();
+    }
+
+    fn snippet_for_selected(&self) -> Option<&str> {
+        let content = self.content.as_ref()?;
+        let session = self.selected()?;
+        content
+            .snippets
+            .get(&session.dedup_key())
+            .map(String::as_str)
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Action {
         match self.mode {
             Mode::Search => self.handle_search_key(key),
+            Mode::ContentSearch => self.handle_content_search_key(key),
             Mode::Browse => self.handle_browse_key(key),
             Mode::Reader => self.handle_reader_key(key),
         }
+    }
+
+    fn handle_content_search_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                self.content = None;
+                self.mode = Mode::Browse;
+                self.refilter();
+            }
+            KeyCode::Enter => return Action::SearchContent,
+            KeyCode::Backspace => {
+                if let Some(content) = self.content.as_mut() {
+                    content.query.pop();
+                }
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(content) = self.content.as_mut() {
+                    content.query.push(character);
+                }
+            }
+            _ => {}
+        }
+        Action::Continue
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) -> Action {
@@ -351,8 +462,21 @@ impl App {
                 self.mode = Mode::Search;
                 Action::Continue
             }
-            KeyCode::Char('c') if !self.query.is_empty() => {
+            KeyCode::Char('f') => {
+                self.content = Some(ContentFilter {
+                    query: self
+                        .content
+                        .as_ref()
+                        .map(|content| content.query.clone())
+                        .unwrap_or_default(),
+                    ..ContentFilter::default()
+                });
+                self.mode = Mode::ContentSearch;
+                Action::Continue
+            }
+            KeyCode::Char('c') if !self.query.is_empty() || self.content.is_some() => {
                 self.query.clear();
+                self.content = None;
                 self.refilter();
                 Action::Continue
             }
@@ -532,8 +656,19 @@ impl App {
     }
 
     fn refilter(&mut self) {
+        let content = self
+            .content
+            .as_ref()
+            .filter(|content| content.error.is_none());
+        let matches_content = |session: &Session| match content {
+            Some(content) => content.snippets.contains_key(&session.dedup_key()),
+            None => true,
+        };
+
         if self.query.trim().is_empty() {
-            self.filtered = (0..self.sessions.len()).collect();
+            self.filtered = (0..self.sessions.len())
+                .filter(|index| matches_content(&self.sessions[*index]))
+                .collect();
             self.select_position(0);
             return;
         }
@@ -545,6 +680,7 @@ impl App {
             .searchable
             .iter()
             .enumerate()
+            .filter(|(index, _)| matches_content(&self.sessions[*index]))
             .filter_map(|(index, text)| {
                 pattern
                     .score(Utf32Str::new(text, &mut buffer), &mut matcher)
@@ -628,12 +764,15 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_details(frame, app, rows[1]);
     }
 
-    let help = if app.mode == Mode::Search {
-        "type to filter  Enter open  Tab keep filter  Esc clear"
-    } else if app.focus == Focus::Details {
-        "DETAILS  j/k scroll  gg/G ends  Ctrl+d/u page  Ctrl+w/h pane  s sort  v read  q quit"
-    } else {
-        "SESSIONS  j/k move  Ctrl+d/u page  Ctrl+w/l pane  s sort  / search  v read  Enter open"
+    let help = match app.mode {
+        Mode::Search => "type to filter  Enter open  Tab keep filter  Esc clear",
+        Mode::ContentSearch => "type words said in a session  Enter search  Esc cancel",
+        _ if app.focus == Focus::Details => {
+            "DETAILS  j/k scroll  gg/G ends  Ctrl+w/h pane  s sort  v read  q quit"
+        }
+        _ => {
+            "SESSIONS  j/k move  Ctrl+w/l pane  s sort  / filter  f find in text  v read  Enter open"
+        }
     };
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
@@ -694,14 +833,16 @@ fn render_search(frame: &mut Frame<'_>, app: &App, area: Rect) {
         app.sessions.len(),
         app.sort_mode.label()
     );
-    let border = if app.mode == Mode::Search {
+    let border = if matches!(app.mode, Mode::Search | Mode::ContentSearch) {
         Color::Cyan
     } else {
         Color::DarkGray
     };
-    let query = if app.query.is_empty() && app.mode == Mode::Browse {
+    let query = if app.mode == Mode::ContentSearch || app.content.is_some() {
+        content_search_line(app)
+    } else if app.query.is_empty() && app.mode == Mode::Browse {
         Line::from(Span::styled(
-            "Press / to search machine, title, project, path, or session ID",
+            "Press / to filter, f to search inside conversations",
             Style::default().fg(Color::DarkGray),
         ))
     } else {
@@ -725,6 +866,44 @@ fn render_search(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ),
         area,
     );
+}
+
+fn content_search_line(app: &App) -> Line<'static> {
+    let Some(content) = app.content.as_ref() else {
+        return Line::from("");
+    };
+    let mut spans = vec![
+        Span::styled("find ", Style::default().fg(Color::Yellow)),
+        Span::raw(content.query.clone()),
+    ];
+    if app.mode == Mode::ContentSearch {
+        spans.push(Span::styled("▏", Style::default().fg(Color::Yellow)));
+        spans.push(Span::styled(
+            "  Enter to search conversations",
+            Style::default().fg(Color::DarkGray),
+        ));
+        return Line::from(spans);
+    }
+    if let Some(error) = &content.error {
+        spans.push(Span::styled(
+            format!("  {error}"),
+            Style::default().fg(Color::Red),
+        ));
+    } else {
+        let elsewhere = if content.elsewhere > 0 {
+            format!(", {} outside this list", content.elsewhere)
+        } else {
+            String::new()
+        };
+        spans.push(Span::styled(
+            format!(
+                "  {} session(s) matched{elsewhere}  ·  c to clear",
+                content.snippets.len()
+            ),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn render_sessions(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -807,7 +986,8 @@ fn render_sessions(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 }
 
 fn render_details(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let lines = if let Some(session) = app.selected() {
+    let snippet = app.snippet_for_selected().map(str::to_owned);
+    let mut lines = if let Some(session) = app.selected() {
         let origin = if session.origin.is_local() {
             "local log".to_owned()
         } else {
@@ -853,6 +1033,15 @@ fn render_details(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     } else {
         vec![Line::from("No sessions match the current search.")]
     };
+
+    if let Some(snippet) = snippet {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Match",
+            Style::default().fg(Color::Yellow),
+        )));
+        lines.push(Line::from(snippet));
+    }
 
     let title = if app.skipped == 0 {
         " Details ".to_owned()
@@ -919,14 +1108,26 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::{Action, App, Focus, Mode, TranscriptLoader};
+    use super::{Action, App, Backend, Focus, Mode, SearchMatch};
     use crate::model::{Agent, Origin, Session, SortMode};
 
-    struct StaticLoader(&'static str);
+    #[derive(Default)]
+    struct FakeBackend {
+        jsonl: &'static str,
+        matches: Vec<SearchMatch>,
+        failure: Option<&'static str>,
+    }
 
-    impl TranscriptLoader for StaticLoader {
-        fn load(&mut self, _session: &Session) -> Result<Vec<u8>> {
-            Ok(self.0.as_bytes().to_vec())
+    impl Backend for FakeBackend {
+        fn transcript(&mut self, _session: &Session) -> Result<Vec<u8>> {
+            Ok(self.jsonl.as_bytes().to_vec())
+        }
+
+        fn search_messages(&mut self, _query: &str) -> Result<Vec<SearchMatch>> {
+            match self.failure {
+                Some(error) => Err(anyhow::anyhow!(error)),
+                None => Ok(self.matches.clone()),
+            }
         }
     }
 
@@ -1086,11 +1287,12 @@ mod tests {
             SortMode::Updated,
         );
         let selected = app.selected().cloned().unwrap();
-        let mut loader = StaticLoader(
-            r#"{"type":"user","timestamp":"2026-02-01T10:01:00Z","message":{"role":"user","content":"hello"}}"#,
-        );
+        let mut backend = FakeBackend {
+            jsonl: r#"{"type":"user","timestamp":"2026-02-01T10:01:00Z","message":{"role":"user","content":"hello"}}"#,
+            ..FakeBackend::default()
+        };
 
-        app.open_reader(&selected, &mut loader);
+        app.open_reader(&selected, &mut backend);
         assert_eq!(app.mode, Mode::Reader);
         let reader = app.reader.as_mut().unwrap();
         reader.max_scroll = 10;
@@ -1108,6 +1310,87 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Browse);
         assert!(app.reader.is_none());
+    }
+
+    #[test]
+    fn content_search_keeps_only_sessions_that_said_it() {
+        let mut app = App::new(
+            vec![
+                session(Agent::Codex, "Local work", "/work/backend"),
+                collected(Agent::Claude, "Sandbox work", "sandbox-7"),
+            ],
+            0,
+            SortMode::Updated,
+        );
+        let wanted = app.sessions[1].clone();
+        let mut backend = FakeBackend {
+            matches: vec![
+                SearchMatch {
+                    host: wanted.host.clone(),
+                    agent: wanted.agent.key().to_owned(),
+                    session_id: wanted.id.clone(),
+                    snippet: "the «auth race» again".to_owned(),
+                },
+                SearchMatch {
+                    host: "a-machine-not-loaded".to_owned(),
+                    agent: "codex".to_owned(),
+                    session_id: "unknown".to_owned(),
+                    snippet: "elsewhere".to_owned(),
+                },
+            ],
+            ..FakeBackend::default()
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        for character in "auth race".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::SearchContent
+        );
+        app.run_content_search(&mut backend);
+
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.filtered, vec![1]);
+        assert_eq!(app.snippet_for_selected(), Some("the «auth race» again"));
+        assert_eq!(
+            app.content.as_ref().unwrap().elsewhere,
+            1,
+            "matches outside the loaded list are counted, not silently dropped"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(app.content.is_none());
+        assert_eq!(app.filtered, vec![0, 1]);
+    }
+
+    #[test]
+    fn a_failed_content_search_reports_instead_of_hiding_everything() {
+        let mut app = App::new(
+            vec![session(Agent::Codex, "Local work", "/work/backend")],
+            0,
+            SortMode::Updated,
+        );
+        let mut backend = FakeBackend {
+            failure: Some("no database configured"),
+            ..FakeBackend::default()
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        app.run_content_search(&mut backend);
+
+        assert_eq!(app.filtered, vec![0], "the list stays usable");
+        assert!(
+            app.content
+                .as_ref()
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("no database")
+        );
     }
 
     #[test]

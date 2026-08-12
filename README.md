@@ -159,15 +159,23 @@ from.
 | `Ctrl+B`, `Ctrl+F`, `PgUp`, `PgDn` | Move a full page |
 | `Ctrl+W`, `Tab`, `h` / `l` | Switch between sessions and details |
 | `s` | Toggle sorting by last update or creation time |
-| `/` | Fuzzy-search; `Tab` keeps the filter for navigation |
+| `/` | Fuzzy-filter the list; `Tab` keeps the filter for navigation |
+| `f` | Find sessions by what was said in them |
+| `c` | Clear the filter and the content search |
 | `v` | Read the transcript of any session |
 | `Enter` | Resume a local session, or read a collected one |
 | `Esc` | Clear an active search; otherwise quit |
 | `q`, `Ctrl+C` | Quit, or leave the transcript |
 
+`/` filters what is on screen — machine, title, project, path, session ID. `f`
+is the one for "I know what I said, not where I said it": it searches the
+collected conversations themselves, keeps the sessions that matched, and shows
+the matching line in the details pane. Matches in sessions outside the current
+list are counted rather than hidden.
+
 The fuzzy matcher is Unicode-aware, so mixed Russian/English prompts, paths,
-and machine names all work. Full-text search falls back to substring matching,
-which matters for inflected languages: `search логов` still finds `логи`.
+and machine names all work. Content search falls back to substring matching,
+which matters for inflected languages: `логов` still finds `логи`.
 
 ## How it works
 

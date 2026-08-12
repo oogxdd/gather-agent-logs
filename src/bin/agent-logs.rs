@@ -15,7 +15,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use agent_logs::{
     config::{self, Config},
-    db::{SessionFilter, Store},
+    db::{HOOK_CONNECT_TIMEOUT, SessionFilter, Store},
     discovery::{self, SourceOptions},
     hooks,
     model::{Agent, Session},
@@ -369,7 +369,7 @@ fn hook(
     let payload = hooks::parse_payload(&raw);
 
     let result = (|| -> Result<()> {
-        let mut store = connect(config)?;
+        let mut store = Store::connect_with_timeout(config.database_url()?, HOOK_CONNECT_TIMEOUT)?;
         let mut options =
             SyncOptions::new(config.host.clone(), discovery::sources(&sources.options()));
         // Claude Code hands over the exact transcript; Codex only says that a
