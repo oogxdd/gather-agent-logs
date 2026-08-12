@@ -6,7 +6,7 @@
 //! their indexes cost several times the raw size, while compressed chunks cost
 //! about a quarter of it. Only real conversation text is indexed for search.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -222,6 +222,27 @@ impl Store {
             )
             .context("could not read the schema version; run `agent-logs setup` first")?;
         Ok(row.and_then(|row| row.get::<_, String>(0).parse().ok()))
+    }
+
+    /// Every session this machine has already reported, in one query. The
+    /// collector compares file sizes against it so an unchanged log costs no
+    /// database round trip at all.
+    pub fn synced_sizes(&mut self, host: &str) -> Result<HashMap<(String, String), (i64, String)>> {
+        let rows = self.client.query(
+            "SELECT agent, session_id, synced_bytes, signature
+             FROM agent_sessions
+             WHERE host = $1",
+            &[&host],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                (
+                    (row.get(0), row.get(1)),
+                    (row.get(2), row.get::<_, String>(3)),
+                )
+            })
+            .collect())
     }
 
     /// Creates the session row if it is new and returns where to resume from.

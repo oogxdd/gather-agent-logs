@@ -5,6 +5,7 @@
 //! left for the next run.
 
 use std::{
+    collections::HashMap,
     fs::File,
     io::{BufRead, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -83,12 +84,18 @@ pub fn sync(store: &mut Store, options: &SyncOptions) -> Result<SyncReport> {
         }
     };
 
+    // One query covers every session this machine has reported. Without it,
+    // a machine with hundreds of finished sessions would ask the database
+    // about each of them on every run.
+    let synced = store.synced_sizes(&options.host)?;
+
     for file in files {
         report.files += 1;
-        if let Err(error) = sync_file(store, options, &file, &mut report) {
-            report
+        match sync_file(store, options, &file, &synced, &mut report) {
+            Ok(()) => {}
+            Err(error) => report
                 .errors
-                .push(format!("{}: {error:#}", file.path.display()));
+                .push(format!("{}: {error:#}", file.path.display())),
         }
     }
     Ok(report)
@@ -133,12 +140,24 @@ fn sync_file(
     store: &mut Store,
     options: &SyncOptions,
     file: &LogFile,
+    synced: &HashMap<(String, String), (i64, String)>,
     report: &mut SyncReport,
 ) -> Result<()> {
     let signature = signature(&file.path)?;
     let Some(session_id) = session_id(file)? else {
         return Ok(());
     };
+
+    // A log of the size the database already holds, with the same first
+    // record, has nothing new in it.
+    if let Some((synced_bytes, stored_signature)) =
+        synced.get(&(file.agent.key().to_owned(), session_id.clone()))
+        && *synced_bytes == file.size as i64
+        && *stored_signature == signature
+    {
+        report.unchanged += 1;
+        return Ok(());
+    }
 
     let mut state = store.session_state(&options.host, &file.agent, &session_id)?;
 

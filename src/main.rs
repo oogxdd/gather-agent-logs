@@ -148,10 +148,18 @@ fn run() -> Result<u8> {
         sessions.extend(discovered.sessions);
     }
 
-    let mut store = if source == SourceArg::Local {
-        None
-    } else {
-        Some(Store::connect(config.database_url()?)?)
+    // An unreachable database must not cost you the local picker: an offline
+    // laptop still has its own sessions, and they are the resumable ones.
+    let mut store = match source {
+        SourceArg::Local => None,
+        SourceArg::Remote => Some(Store::connect(config.database_url()?)?),
+        SourceArg::All => match Store::connect(config.database_url()?) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                eprintln!("warning: showing local sessions only: {error:#}");
+                None
+            }
+        },
     };
 
     if let Some(store) = store.as_mut() {
