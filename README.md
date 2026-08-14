@@ -1,17 +1,19 @@
 # agent-resume
 
-`agent-resume` is a fast terminal picker for returning to local Codex and
-Claude Code sessions. It finds both agents' native JSONL logs, shows the most
-recent work first, and hands the selected session back to the original CLI.
+`agent-resume` is a fast terminal picker for returning to local Codex, Claude
+Code, and Crush sessions. It reads each agent's own session store, shows the
+most recent work first, and hands the selected session back to the original
+CLI.
 
 ```text
-┌ agent-resume ─────────────────────────────────────── 7 of 7 ┐
+┌ agent-resume ─────────────────────────────────────── 8 of 8 ┐
 │ Press / to search title, project, path, or session ID       │
 └──────────────────────────────────────────────────────────────┘
 ┌ Sessions ─────────────────────────┬ Details ────────────────┐
 │ Agent  Updated  Project   Prompt  │ Agent   Codex           │
 │›Codex  now      backend   fix...  │ Project /work/backend   │
 │ Claude 2h ago   web       add...  │ ID      019f...         │
+│ Crush  1d ago   infra     tidy... │                         │
 └───────────────────────────────────┴─────────────────────────┘
 ```
 
@@ -20,7 +22,8 @@ recent work first, and hands the selected session back to the original CLI.
 Requirements:
 
 - Rust 1.88 or newer
-- Codex, Claude Code, or both installed and available on `PATH`
+- A C compiler, because Crush databases are read through bundled SQLite
+- Codex, Claude Code, or Crush installed and available on `PATH`
 
 From the repository root, launch the picker without installing it:
 
@@ -42,15 +45,22 @@ The default scan locations are:
 
 - Codex: `$CODEX_HOME/sessions`, otherwise `~/.codex/sessions`
 - Claude Code: `$CLAUDE_CONFIG_DIR/projects`, otherwise `~/.claude/projects`
+- Crush: `$XDG_DATA_HOME/crush`, otherwise `~/.local/share/crush`,
+  `~/Library/Application Support/crush`, or `~/.crush`
+
+Crush keeps one SQLite database per project rather than a central log
+directory, so the picker reads the `projects.json` registry in that data
+directory and opens every `crush.db` it lists.
 
 Choose a session and press `Enter`, including directly from search. The picker
 restores the terminal, changes to the session's saved working directory, and
-runs either `codex resume SESSION_ID` or `claude --resume SESSION_ID`. On Unix,
-the native agent replaces `agent-resume`, so no wrapper process remains.
+runs `codex resume SESSION_ID`, `claude --resume SESSION_ID`, or
+`crush --data-dir PROJECT_DATA_DIR --session SESSION_ID`. On Unix, the native
+agent replaces `agent-resume`, so no wrapper process remains.
 
-Session files are read-only. If a session's saved working directory no longer
-exists, the picker stops with an error instead of resuming it in the wrong
-project.
+Session files and databases are opened read-only. If a session's saved working
+directory no longer exists, the picker stops with an error instead of resuming
+it in the wrong project.
 
 ## Keys
 
@@ -77,12 +87,13 @@ work as expected.
 ```text
 agent-resume [OPTIONS]
 
-  --agent <all|codex|claude>  Limit the list to one agent
-  --sort <updated|created>     Choose the initial sort order
-  --home <HOME_DIR>           Scan another home directory
-  --codex-dir <SESSIONS_DIR>  Override the Codex sessions directory
-  --claude-dir <PROJECTS_DIR> Override the Claude projects directory
-  --list                      Print sessions without opening the TUI
+  --agent <all|codex|claude|crush>  Limit the list to one agent
+  --sort <updated|created>          Choose the initial sort order
+  --home <HOME_DIR>                 Scan another home directory
+  --codex-dir <SESSIONS_DIR>        Override the Codex sessions directory
+  --claude-dir <PROJECTS_DIR>       Override the Claude projects directory
+  --crush-dir <DATA_DIR>            Override the Crush data directory
+  --list                            Print sessions without opening the TUI
 ```
 
 For example:
@@ -94,6 +105,15 @@ agent-resume --list
 agent-resume --codex-dir /mnt/old-home/.codex/sessions
 ```
 
+`--crush-dir` accepts either a data directory holding `projects.json` or a
+single project directory holding `crush.db`, so a copied `.crush` directory
+works without its registry:
+
+```bash
+agent-resume --crush-dir /mnt/old-home/.local/share/crush
+agent-resume --crush-dir /mnt/backup/project/.crush
+```
+
 ## How scanning stays light
 
 The program stores only small metadata records in memory. It streams each JSONL
@@ -103,6 +123,13 @@ Known injected context such as `AGENTS.md`, environment blocks, plugin hints,
 and Claude slash-command output is excluded from titles. Claude subagent logs
 are excluded from the top-level session list. File modification time is used
 only as a fallback for old or incomplete logs without message timestamps.
+
+Crush databases are queried instead of streamed: one statement lists the
+sessions, and a second one looks up an opening prompt only for sessions Crush
+has not titled yet. Crush child sessions, the ones a session spawns for its own
+agents, are excluded like Claude subagents. Databases are opened read-only, and
+a database whose write-ahead log cannot be read is retried as an immutable
+file, so a snapshot on read-only media still lists its checkpointed sessions.
 
 The TUI keeps the metadata list but only renders the visible viewport. It does
 not load full transcripts and never modifies session files.
@@ -124,11 +151,15 @@ when necessary:
 ```bash
 agent-resume --codex-dir ~/.codex/sessions
 agent-resume --claude-dir ~/.claude/projects
+agent-resume --crush-dir ~/.local/share/crush
 ```
 
-If selecting a session reports that `codex` or `claude` cannot be launched,
-run the corresponding command directly to confirm it is installed and on
-`PATH`.
+Run `crush dirs` to confirm where Crush keeps its data on this machine, and
+`crush projects` to see the project databases it knows about.
+
+If selecting a session reports that `codex`, `claude`, or `crush` cannot be
+launched, run the corresponding command directly to confirm it is installed
+and on `PATH`.
 
 ## Development
 

@@ -523,6 +523,7 @@ fn render_sessions(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let agent_style = match session.agent {
             Agent::Codex => Style::default().fg(Color::Cyan),
             Agent::Claude => Style::default().fg(Color::Magenta),
+            Agent::Crush => Style::default().fg(Color::Green),
         };
         Row::new([
             Cell::from(session.agent.label()).style(agent_style),

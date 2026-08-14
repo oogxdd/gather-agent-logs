@@ -18,7 +18,7 @@ use model::{Agent, Session, SortMode, sort_sessions};
 #[command(
     name = "agent-resume",
     version,
-    about = "Find and resume local Codex and Claude Code sessions"
+    about = "Find and resume local Codex, Claude Code, and Crush sessions"
 )]
 struct Cli {
     /// Only show sessions from one agent.
@@ -41,6 +41,10 @@ struct Cli {
     #[arg(long, value_name = "PROJECTS_DIR")]
     claude_dir: Option<PathBuf>,
 
+    /// Read Crush databases from this data directory.
+    #[arg(long, value_name = "DATA_DIR")]
+    crush_dir: Option<PathBuf>,
+
     /// Print the discovered sessions instead of opening the terminal UI.
     #[arg(long)]
     list: bool,
@@ -52,6 +56,7 @@ enum AgentFilter {
     All,
     Codex,
     Claude,
+    Crush,
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -76,6 +81,7 @@ impl AgentFilter {
             Self::All => true,
             Self::Codex => agent == Agent::Codex,
             Self::Claude => agent == Agent::Claude,
+            Self::Crush => agent == Agent::Crush,
         }
     }
 }
@@ -111,12 +117,22 @@ fn run() -> Result<u8> {
             .unwrap_or_else(|| default_session_dir(&home, ".claude/projects")),
         None => default_session_dir(&home, ".claude/projects"),
     };
+    let crush_dir = match cli.crush_dir {
+        Some(directory) => directory,
+        None if !home_was_explicit => env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .map(|directory| directory.join("crush"))
+            .unwrap_or_else(|| default_crush_dir(&home)),
+        None => default_crush_dir(&home),
+    };
 
     let mut discovered = discover(&DiscoveryOptions {
         codex_dir,
         claude_dir,
+        crush_dir,
         include_codex: cli.agent.includes(Agent::Codex),
         include_claude: cli.agent.includes(Agent::Claude),
+        include_crush: cli.agent.includes(Agent::Crush),
     });
     let sort_mode = SortMode::from(cli.sort);
     sort_sessions(&mut discovered.sessions, sort_mode);
@@ -136,7 +152,7 @@ fn run() -> Result<u8> {
         bail!("the picker needs an interactive terminal; use --list for plain output");
     }
     if discovered.sessions.is_empty() {
-        bail!("no Codex or Claude Code sessions found");
+        bail!("no Codex, Claude Code, or Crush sessions found");
     }
 
     let selection = ui::pick(discovered.sessions, discovered.skipped, sort_mode)?;
@@ -151,6 +167,23 @@ fn default_session_dir(home: &Option<PathBuf>, relative: &str) -> PathBuf {
     home.as_ref()
         .map(|directory| directory.join(relative))
         .unwrap_or_default()
+}
+
+/// Crush keeps its project registry in the platform data directory, and falls
+/// back to a single database in ~/.crush on installs that never had one.
+fn default_crush_dir(home: &Option<PathBuf>) -> PathBuf {
+    const CANDIDATES: &[&str] = &[
+        ".local/share/crush",
+        "Library/Application Support/crush",
+        ".crush",
+    ];
+
+    let default = default_session_dir(home, CANDIDATES[0]);
+    CANDIDATES
+        .iter()
+        .map(|relative| default_session_dir(home, relative))
+        .find(|directory| directory.is_dir())
+        .unwrap_or(default)
 }
 
 fn print_sessions(sessions: &[Session]) {
@@ -203,6 +236,20 @@ fn resume_command(session: &Session) -> Result<Command> {
             command.arg("--resume").arg(&session.id);
             command
         }
+        Agent::Crush => {
+            let mut command = Command::new("crush");
+            // Crush finds its database from the working directory, so point it
+            // at the exact one this session was read from.
+            if let Some(data_dir) = session
+                .path
+                .parent()
+                .filter(|directory| !directory.as_os_str().is_empty())
+            {
+                command.arg("--data-dir").arg(data_dir);
+            }
+            command.arg("--session").arg(&session.id);
+            command
+        }
     };
 
     if !session.cwd.as_os_str().is_empty() && !session.cwd.is_dir() {
@@ -249,6 +296,25 @@ mod tests {
             command.get_args().collect::<Vec<_>>(),
             [
                 OsStr::new("resume"),
+                OsStr::new("019ff21e-4824-70d2-8cb6-57e5b1aebefb")
+            ]
+        );
+        assert_eq!(command.get_current_dir(), Some(session.cwd.as_path()));
+    }
+
+    #[test]
+    fn crush_resume_targets_the_database_the_session_came_from() {
+        let mut session = session(Agent::Crush);
+        session.path = session.cwd.join(".crush/crush.db");
+        let command = resume_command(&session).unwrap();
+
+        assert_eq!(command.get_program(), OsStr::new("crush"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                OsStr::new("--data-dir"),
+                session.cwd.join(".crush").as_os_str(),
+                OsStr::new("--session"),
                 OsStr::new("019ff21e-4824-70d2-8cb6-57e5b1aebefb")
             ]
         );

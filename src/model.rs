@@ -36,6 +36,7 @@ impl SortMode {
 pub enum Agent {
     Codex,
     Claude,
+    Crush,
 }
 
 impl Agent {
@@ -43,6 +44,7 @@ impl Agent {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Crush => "crush",
         }
     }
 
@@ -50,6 +52,7 @@ impl Agent {
         match self {
             Self::Codex => "Codex",
             Self::Claude => "Claude",
+            Self::Crush => "Crush",
         }
     }
 
@@ -57,6 +60,7 @@ impl Agent {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Crush => "crush",
         }
     }
 }
