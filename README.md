@@ -1,123 +1,262 @@
-# gather-chatgpt-logs
+# gather-agent-logs
 
-Keeps your personal ChatGPT conversations in a local Postgres database, updated
-as you use the desktop app.
+A unified, local, queryable inventory of ChatGPT, ChatGPT Work, and Codex
+history — one Postgres store, one shape, searchable across every source, with
+every result linked back to where it came from.
 
-## Why this is not a file copy
+Built to sit under an MCP server: `hist_query.py` is a set of plain functions
+returning bounded, JSON-serialisable results, and the CLI is a thin wrapper over
+them. Wiring MCP on top means calling those functions; no retrieval logic has to
+move.
 
-The ChatGPT desktop app stores **no conversation bodies on disk**. Verified on
-macOS with app 26.814.41957 (Chromium 151):
+## What each source actually allows
 
-- there is no `IndexedDB`, `Service Worker`, or `Cache Storage` directory in its
-  Chromium profile at `~/Library/Application Support/Codex`
-- `Default/History` is empty and the HTTP cache holds only static assets
-- the sidebar list is cached in localStorage under `codex.chatgpt-conversations`
-  — titles and ids only, every `mapping` is `null`, and it holds a sliding
-  window of the last 20
-- offline, opening a conversation fails with
-  `/conversation/{id} → net::ERR_INTERNET_DISCONNECTED`
+The three sources are not equally accessible, and the difference is not a
+detail — it decides how each one is collected.
 
-So message content only exists on the server and in the app's memory. What the
-app does have is an authenticated `https://chatgpt.com` page context. This tool
-attaches to that context over the DevTools protocol and asks it to fetch the
-conversations, so **the session token never leaves the app** — nothing reads
-your keychain, cookie jar, or `~/.codex/auth.json`.
+| Source | Where it lives | How it is collected |
+|---|---|---|
+| **Codex** (CLI, TUI, desktop) | `~/.codex/sessions/**.jsonl` locally, in full | plain file read |
+| **ChatGPT Work** | same place — Work runs on the local Codex runtime | plain file read |
+| **ChatGPT** (personal) | server-side only | driven through the desktop app |
 
-ChatGPT **Work** and **Codex** threads are a different story: those run on the
-local agent runtime and are written to `~/.codex/sessions/**.jsonl` in full, so
-they are a plain file copy — `collect-agent-conversations.sh`, in this repo,
-handles them. The two do not overlap: a Work thread never appears in the
-personal conversation listing this tool reads.
+**Codex and ChatGPT Work are one mechanism.** The ChatGPT desktop app runs Work
+threads on the local agent runtime, so a Work session is written to
+`~/.codex/sessions` as an ordinary rollout. The only thing separating them is
+`originator` on the first line of the file: `codex_work_desktop` is Work,
+`Codex Desktop` / `codex_cli_rs` / `codex-tui` are Codex. Both are read straight
+off disk and never modified.
 
-## Setup
+**Personal ChatGPT keeps nothing on disk.** Verified on macOS with app
+26.814.41957 (Chromium 151): no `IndexedDB`, `Service Worker`, or `Cache
+Storage` directory in its profile at `~/Library/Application Support/Codex`;
+`Default/History` empty; the HTTP cache holds only static assets; the sidebar
+list is cached in localStorage under `codex.chatgpt-conversations` with every
+`mapping` null, a sliding window of the last 20. Offline, opening a conversation
+fails with `/conversation/{id} → net::ERR_INTERNET_DISCONNECTED`.
+
+So message content exists only on the server and in the app's memory. What the
+app does have is an authenticated `https://chatgpt.com` page. `chatgpt_sync.py`
+attaches to that page over the DevTools protocol and asks it to fetch — **the
+session token never leaves the app**; nothing reads the keychain, the cookie
+jar, or `~/.codex/auth.json`.
+
+Read [Limitations](#limitations) before relying on the ChatGPT side.
+
+## Install
+
+Requires PostgreSQL 14+, Python 3.10+, and (for the ChatGPT side) the ChatGPT
+desktop app signed in.
 
 ```bash
-./install.sh
+./install.sh          # virtualenv, database, schema, optional LaunchAgent
 ```
 
-Creates a virtualenv, the `chatgpt_logs` database, the schema, and optionally a
-LaunchAgent that runs the daemon at login.
+Everything reads `CHATGPT_SYNC_DSN`, default `postgresql:///chatgpt_logs`.
 
-## Running
+## Collect
 
-The app must be started with its DevTools port open — Chromium only accepts the
-flag at process start, so use this instead of the Dock icon:
+**Codex and ChatGPT Work** — a plain scan, no app involvement:
 
 ```bash
-./start-chatgpt.sh
+./codex_import.py import                       # incremental; unchanged files skipped
+./codex_import.py import --machine work-laptop # name this computer explicitly
+./codex_import.py status                       # per-source inventory
 ```
 
-Then:
+**Personal ChatGPT** — needs the desktop app running with its DevTools port.
+Chromium only reads that flag at process start, so the daemon starts the app
+itself:
 
 ```bash
-./chatgpt_sync.py doctor      # check port, session, and database
-./chatgpt_sync.py once        # one cycle
-./chatgpt_sync.py daemon      # keep syncing, --interval 120 by default
-./chatgpt_sync.py status      # what is stored, and what is pending
+./chatgpt_sync.py doctor      # check app, port, session, database
+./chatgpt_sync.py daemon      # keeps syncing; starts ChatGPT when it is not up
+./chatgpt_sync.py status
 ```
 
 An idle cycle is one HTTP request and about two seconds: the listing is ordered
 newest-first, so pagination stops at the first page that has not changed.
 
-## History is skipped by default
+### History is skipped by default
 
-The first run records a **baseline** timestamp. Every conversation is indexed
-(id, title, timestamps — cheap, a few seconds for hundreds of them), but message
-bodies are only fetched for conversations updated at or after the baseline. A
-fresh install does not pull years of history.
-
-To pull older bodies as well, deliberately:
+The first ChatGPT run records a **baseline**. Every conversation is indexed (id,
+title, timestamps — cheap), but message bodies are only fetched for
+conversations updated at or after it. A fresh install does not pull years of
+history. To pull older bodies deliberately:
 
 ```bash
 ./chatgpt_sync.py backfill --limit 50   # 50 most recent pending
 ./chatgpt_sync.py backfill              # everything
 ```
 
-## Knowing what is not captured yet
+Codex has no equivalent: local files are read in full on the first pass.
 
-The listing gives `update_time` for every conversation without opening it, so a
-conversation you started and walked away from is detectable even if you never
-looked at the answer:
+## Query
 
-```sql
-SELECT * FROM chatgpt.pending;
+```bash
+./hist_query.py sources                                   # inventory + import state
+./hist_query.py search "advisory lock" --platform codex   # search message text
+./hist_query.py search "postgres" --project casey --role user --since 2026-03-01
+./hist_query.py conversations --platform chatgpt_work
+./hist_query.py show 1424 --limit 40                      # one transcript
+./hist_query.py context 394448 --before 3 --after 3       # messages around a hit
+./hist_query.py message 394448                            # full text plus raw record
+./hist_query.py status                                    # what failed, what is stale
 ```
 
-A row appears when the stored body is missing (`never captured`) or older than
-the server's version (`stale`). The daemon drains this list on each cycle.
+Add `--json` to any of them for machine-readable output.
 
-## Schema
+Filters available on `search` and `conversations`: `--platform`, `--source`,
+`--project` (substring, matches repo url too), `--machine`, `--since`,
+`--until`, `--limit`, `--offset`; plus `--role` on search and `--title`,
+`--status` on conversations.
+
+`search` uses Postgres full-text with the `simple` configuration — no stemming,
+so it behaves identically for every language in the corpus. Quote a phrase to
+require adjacency. `--mode substring` is the escape hatch for identifiers and
+paths the tokeniser splits up.
+
+### As functions
+
+```python
+from histstore import Store
+import hist_query
+
+with Store() as store:
+    hits = hist_query.search(store, "concurrency keys", platform="chatgpt", limit=5)
+    for hit in hits["hits"]:
+        print(hit["snippet"], hit["source"]["source_ref"])
+        around = hist_query.get_context(store, hit["message_id"], before=2, after=2)
+```
+
+Every result carries a `source` block — platform, source id, external id,
+`source_ref` (the rollout path or the conversation URL), machine, project,
+branch — so a caller can always name the original. Results are bounded:
+`limit` is clamped to 200 and message text to 4000 characters with an explicit
+`truncated` flag, so an agent's context window cannot be flooded.
+
+## Two computers
+
+Each machine runs its own collector and records its own name:
+
+```bash
+./codex_import.py import --machine desk-pc
+./codex_import.py import --machine work-laptop
+```
+
+Source ids become `codex:desk-pc`, `chatgpt_work:work-laptop`, and so on; the
+`machine` column is on every conversation and is a filter everywhere. The two
+never need to be online at the same time — they only need to reach the same
+Postgres, or to run against a local one whose contents are merged later.
+
+The three states the brief asks to distinguish are separate values on
+`hist.sources.status`:
+
+| Meaning | status | set when |
+|---|---|---|
+| No new information | `ok`, `imported = 0` on the run | a scan found only unchanged files |
+| Computer offline | `offline` | the collector cannot find `~/.codex` |
+| Import failed | `failed` | the run raised; per-file failures are rows |
+
+A file that cannot be parsed is stored as a conversation with
+`import_status = 'failed'` and the error text, so it appears in the inventory
+instead of vanishing. `./hist_query.py status` lists them.
+
+## Data model
 
 ```text
-chatgpt.conversations   one row per conversation; index_raw + body_raw as jsonb
-chatgpt.messages        mapping exploded into rows, tree kept via parent_id/children
-chatgpt.pending         view: bodies missing or out of date
-chatgpt.sync_state      watermarks, notably baseline_at
-chatgpt.sync_runs       per-cycle history and errors
+hist.sources        one row per platform+account+machine, with import state
+hist.conversations  unified conversations and sessions, `raw` = original record
+hist.messages       roles user/assistant/reasoning/tool_call/tool_output/…
+hist.artifacts      commands run, files patched, web searches
+hist.import_runs    per-run counts and errors
+hist.sync_state     watermarks (baseline, daemon runtime state)
+
+hist.overview       per-conversation status and scope  (view)
+hist.pending        ChatGPT bodies missing or out of date  (view)
+hist.inventory      per-source rollup  (view)
 ```
 
-Messages keep a full-text index, so searching works across languages:
+Imported content is verbatim. `raw` holds the original record on every
+conversation and message row; normalised columns are a projection of it. The
+one exception is NUL bytes, which Postgres rejects in both `text` and `jsonb`
+and which Codex command output occasionally contains — they are stripped, and
+`source_ref` still points at the untouched file.
 
-```sql
-SELECT c.title, m.role, m.text
-FROM chatgpt.messages m JOIN chatgpt.conversations c ON c.id = m.conversation_id
-WHERE to_tsvector('simple', coalesce(m.text, '')) @@ plainto_tsquery('simple', 'postgres');
+Derived material — summaries, extracted tasks, detected decisions, suggested
+relationships — does not belong in these tables. Put it in a separate `derived`
+schema keyed by `conversation_id` / `message_id`.
+
+App-injected prompts (`<permissions instructions>`, `<app-context>`,
+`# AGENTS.md instructions for …` and friends) repeat verbatim across hundreds of
+sessions. They are stored, but `searchable = false` keeps them out of the index
+so they cannot drown real hits.
+
+## Tray app
+
+`tray/` is a macOS menu bar app (Tauri) over the ChatGPT daemon. Three states:
+grey when ChatGPT is not running, green when it is running with the debug port,
+red when it is running without one and nothing can be synced. The panel shows
+the last sync, per-conversation status, and a manual sync button.
+
+```bash
+cd tray && pnpm install && pnpm build
 ```
 
-The mapping root node is stored as a message row with no role and no text; that
-is the tree root, not a bug.
+It owns no sync logic — it reads Postgres and shells out to `chatgpt_sync.py`.
 
-## Notes
+## Tests
 
-While the DevTools port is open, any local process can drive the app. It binds
-to `127.0.0.1` only, but do not leave it open on a shared machine.
+```bash
+./test_hist.py
+```
 
-`/backend-api` is not a public interface. It can change without notice, and it
-rate-limits — `--pause` controls the gap between body fetches.
+Runs against a throwaway database (`chatgpt_logs_test`, created if missing), so
+it never touches the real store. Covers import round-trip, Work/Codex platform
+split, unreadable files staying visible, incremental skip, resumed sessions not
+overwriting each other, cross-source search, every filter, injected prompts
+being excluded, surrounding context, and result bounding.
 
-The database holds your conversations in full. Keep it local; `.venv/` and
-`logs/` are already git-ignored.
+## Limitations
 
-## Requirements
+- **Personal ChatGPT is not a file copy.** It requires the desktop app to be
+  running with `--remote-debugging-port`, and it reads through the app's own
+  authenticated page. If the app is launched from the Dock without that flag,
+  nothing can be synced; the daemon reports `stalled` and notifies rather than
+  failing quietly.
+- **`/backend-api` is not a public interface.** It can change without notice and
+  it rate-limits (`--pause` controls the gap between body fetches). Automated
+  access to it is outside ChatGPT's intended use; the officially supported route
+  for personal history is Settings → Data controls → Export data. Decide
+  deliberately which you want. Nothing about the mechanism is hidden inside the
+  code: it is one file, `chatgpt_sync.py`, and this paragraph.
+- **`total` from the ChatGPT listing is unreliable** — it returned 2, 6, and 21
+  for the same account depending on parameters, against 722 actual
+  conversations. Pagination runs to an empty page instead.
+- **ChatGPT attachments and generated images are not fetched.** Only the
+  conversation mapping is. Codex artifacts (patches, commands, searches) are
+  captured.
+- **Reasoning content from Codex is mostly opaque** — `encrypted_content` is
+  stored as-is; only the plaintext summary, when present, is searchable.
+- **The tray app is macOS-only.** The importers and the query layer are not: the
+  Python side is platform-agnostic, and Codex collection on Windows needs only
+  `~/.codex` to exist. The ChatGPT daemon's app control (`open -a`, `osascript`,
+  `pgrep`) is macOS-specific and would need Windows equivalents.
+- **No vector search.** Keyword and full-text only, by design.
 
-macOS, Python 3.10+, PostgreSQL 14+, and the ChatGPT desktop app signed in.
+## Privacy
+
+Everything is local: Postgres on your machine, no external service, no
+telemetry. Credentials never appear in source or config — the ChatGPT side
+borrows the desktop app's own session in-place and never extracts a token. The
+database holds your conversations in full; `.venv/`, `logs/`, and build output
+are git-ignored, and nothing in this repository contains history or secrets.
+
+To remove imported data: rows are traceable by `source_id`, so
+`DELETE FROM hist.sources WHERE id = '…'` cascades to everything from it.
+
+## Also here
+
+`collect-agent-conversations.sh` is the older, standalone snapshot script: it
+copies Claude Code, Codex, and Crush conversations into a timestamped folder of
+JSONL files, with no database. Independent of everything above.

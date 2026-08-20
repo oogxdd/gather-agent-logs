@@ -166,7 +166,8 @@ async fn get_status(settings: State<'_, Settings>) -> Result<Value, String> {
                     count(*) FILTER (WHERE status = 'never')::bigint,
                     count(*) FILTER (WHERE status = 'syncing')::bigint,
                     count(*) FILTER (WHERE scope = 'managed')::bigint
-             FROM chatgpt.overview",
+             FROM hist.overview
+             WHERE platform = 'chatgpt'",
             &[],
         )
         .await
@@ -174,8 +175,8 @@ async fn get_status(settings: State<'_, Settings>) -> Result<Value, String> {
 
     let last_run = client
         .query_opt(
-            "SELECT started_at, finished_at, status, bodies_synced, error
-             FROM chatgpt.sync_runs ORDER BY id DESC LIMIT 1",
+            "SELECT started_at, finished_at, status, imported, error
+             FROM hist.import_runs WHERE source_id LIKE 'chatgpt:%' ORDER BY id DESC LIMIT 1",
             &[],
         )
         .await
@@ -183,8 +184,8 @@ async fn get_status(settings: State<'_, Settings>) -> Result<Value, String> {
 
     let last_ok = client
         .query_opt(
-            "SELECT finished_at FROM chatgpt.sync_runs
-             WHERE status = 'ok' AND finished_at IS NOT NULL
+            "SELECT finished_at FROM hist.import_runs
+             WHERE source_id LIKE 'chatgpt:%' AND status = 'ok' AND finished_at IS NOT NULL
              ORDER BY id DESC LIMIT 1",
             &[],
         )
@@ -193,7 +194,7 @@ async fn get_status(settings: State<'_, Settings>) -> Result<Value, String> {
 
     let runtime = client
         .query_opt(
-            "SELECT value FROM chatgpt.sync_state WHERE key = 'runtime'",
+            "SELECT value FROM hist.sync_state WHERE key = 'runtime'",
             &[],
         )
         .await
@@ -202,7 +203,7 @@ async fn get_status(settings: State<'_, Settings>) -> Result<Value, String> {
         .unwrap_or(Value::Null);
 
     let messages: i64 = client
-        .query_one("SELECT count(*)::bigint FROM chatgpt.messages", &[])
+        .query_one("SELECT count(*)::bigint FROM hist.messages m JOIN hist.conversations c ON c.id = m.conversation_id WHERE c.platform = 'chatgpt'", &[])
         .await
         .map_err(|e| format!("messages: {e}"))?
         .get(0);
@@ -241,9 +242,10 @@ async fn list_conversations(
     // 'managed' hides the pre-baseline history, which is skipped on purpose and
     // would otherwise read as hundreds of failures.
     let sql = "SELECT id::text, title, update_time, body_synced_at, status, scope, message_count
-               FROM chatgpt.overview
+               FROM hist.overview
+             WHERE platform = 'chatgpt'
                WHERE ($1 = 'all' OR scope = $1)
-               ORDER BY update_time DESC
+               ORDER BY updated_at DESC
                LIMIT $2";
     let rows = client
         .query(sql, &[&scope, &limit])

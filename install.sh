@@ -35,10 +35,19 @@ fi
 echo "==> schema"
 "$here/.venv/bin/python" "$here/chatgpt_sync.py" doctor --dsn "$dsn" || true
 
-chmod +x "$here/start-chatgpt.sh" "$here/chatgpt_sync.py"
+chmod +x "$here/start-chatgpt.sh" "$here"/*.py
 
 echo
-read -r -p "Install a LaunchAgent to run the daemon at login? [y/N] " reply
+echo "==> importing local Codex and ChatGPT Work sessions"
+"$here/.venv/bin/python" "$here/codex_import.py" import --dsn "$dsn" | tail -1
+
+echo
+echo "Query it with:"
+echo "  $here/hist_query.py sources"
+echo "  $here/hist_query.py search 'some phrase'"
+
+echo
+read -r -p "Install a LaunchAgent to run the ChatGPT daemon at login? [y/N] " reply
 if [[ $reply != [yY] ]]; then
   echo "Skipped. Run it manually with:"
   echo "  $here/.venv/bin/python $here/chatgpt_sync.py daemon"

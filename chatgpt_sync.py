@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Sync ChatGPT conversations from the desktop app into local Postgres.
+"""Sync personal ChatGPT conversations into the unified history store.
 
 The ChatGPT desktop app keeps no conversation bodies on disk: the sidebar list
-is cached in localStorage, but message content is fetched per-open and held in
-memory. So there is nothing to copy off the filesystem. What the app does have
-is an authenticated ``https://chatgpt.com`` page context. This tool drives that
-context over the DevTools protocol and asks it to fetch the conversations, so
-the session token never leaves the app.
+is cached in localStorage with every mapping null, and opening a conversation
+offline fails outright. Message content only exists server-side and in the app's
+memory, so there is nothing to copy off the filesystem.
 
-Only personal ChatGPT conversations are synced. ChatGPT Work and Codex threads
-are written to ``~/.codex/sessions`` as JSONL and are collected separately.
+What the app does have is an authenticated https://chatgpt.com page context.
+This tool drives that context over the DevTools protocol and asks it to fetch,
+so the session token never leaves the app — nothing here reads the keychain,
+the cookie jar, or ~/.codex/auth.json.
 
+ChatGPT Work and Codex threads run on the local agent runtime and are written
+to ~/.codex/sessions as JSONL; codex_import.py handles those.
+
+    ./chatgpt_sync.py doctor
     ./chatgpt_sync.py once
     ./chatgpt_sync.py daemon --interval 120
     ./chatgpt_sync.py status
@@ -27,20 +31,14 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
-from pathlib import Path
-
-import psycopg
-from psycopg.types.json import Json
 
 from cdp import CDPError, WebSocket, evaluate, http_json
+from histstore import DEFAULT_DSN, Store, scrub, to_timestamp
 
-DEFAULT_DSN = os.environ.get("CHATGPT_SYNC_DSN", "postgresql:///chatgpt_logs")
-SYNC_LOCK_KEY = 0x6368_6774  # 'chgt' — advisory lock shared by every entry point
 DEFAULT_PORT = int(os.environ.get("CHATGPT_SYNC_PORT", "9222"))
-SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
 # The app's own listing parameters. They matter: with the defaults the API
-# reports a fraction of the conversations (21 of 722 on the machine this was
+# returns a fraction of the conversations (21 of 722 on the machine this was
 # written against), and `total` in the response is unreliable regardless, so
 # pagination runs until a page comes back empty.
 LIST_PARAMS = (
@@ -55,22 +53,7 @@ _shutdown = False
 
 
 def _log(message: str) -> None:
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    print(f"{stamp} {message}", flush=True)
-
-
-def to_timestamp(value) -> datetime | None:
-    """The listing returns ISO strings; conversation bodies return epoch floats."""
-    if value is None or value == "":
-        return None
-    if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(value, tz=timezone.utc)
-    if isinstance(value, str):
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    return None
+    print(f"{datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ} {message}", flush=True)
 
 
 # --------------------------------------------------------------------------
@@ -78,16 +61,16 @@ def to_timestamp(value) -> datetime | None:
 #
 # Chromium only reads --remote-debugging-port at process start, so an app the
 # user launched from the Dock can never be attached to. The daemon therefore
-# owns launching it. States are written to chatgpt.sync_state so a wrapper (a
-# tray app, say) can render them without reimplementing any of this.
+# owns launching it. States are written to hist.sync_state so a wrapper (the
+# tray app) can render them without reimplementing any of this.
 # --------------------------------------------------------------------------
 
 APP_NAME = os.environ.get("CHATGPT_APP", "ChatGPT")
 APP_BINARY = f"/Applications/{APP_NAME}.app/Contents/MacOS/{APP_NAME}"
 
-READY = "ready"          # debug port reachable
-STALLED = "stalled"      # app is up, but without the port: nothing can be synced
-UNAVAILABLE = "unavailable"  # app is not running and could not be started
+READY = "ready"
+STALLED = "stalled"
+UNAVAILABLE = "unavailable"
 
 
 def port_open(port: int) -> bool:
@@ -146,7 +129,7 @@ def ensure_app(port: int, policy: str) -> tuple[str, str]:
     if running and policy != "always":
         return STALLED, (
             f"{APP_NAME} is running without --remote-debugging-port. "
-            f"Quit it and let the daemon start it, or use --launch always."
+            "Quit it and let the daemon start it, or use --launch always."
         )
     if running:
         _log(f"restarting {APP_NAME}: running without the debug port")
@@ -239,11 +222,14 @@ class AppContext:
         try:
             probe = evaluate(ws, READY_JS, timeout=30)
             if probe.get("origin") != "https://chatgpt.com":
+                ws.close()
                 return f"origin is {probe.get('origin')}"
             if probe.get("readyState") == "loading":
+                ws.close()
                 return "page still loading"
             info = evaluate(ws, PRIME_JS, timeout=self.timeout)
             if not info.get("ok"):
+                ws.close()
                 return str(info.get("error"))
         except CDPError as exc:
             ws.close()
@@ -321,238 +307,142 @@ class AppContext:
 
 
 # --------------------------------------------------------------------------
-# Storage
+# Storage helpers on top of the shared store
 # --------------------------------------------------------------------------
 
-CONVERSATION_UPSERT = """
-INSERT INTO chatgpt.conversations
-    (id, title, create_time, update_time, is_archived, is_starred,
-     is_temporary_chat, workspace_id, conversation_origin, gizmo_id,
-     async_status, current_node, index_raw, index_synced_at)
-VALUES (%(id)s, %(title)s, %(create_time)s, %(update_time)s, %(is_archived)s,
-        %(is_starred)s, %(is_temporary_chat)s, %(workspace_id)s,
-        %(conversation_origin)s, %(gizmo_id)s, %(async_status)s,
-        %(current_node)s, %(index_raw)s, now())
-ON CONFLICT (id) DO UPDATE SET
-    title               = EXCLUDED.title,
-    create_time         = EXCLUDED.create_time,
-    update_time         = EXCLUDED.update_time,
-    is_archived         = EXCLUDED.is_archived,
-    is_starred          = EXCLUDED.is_starred,
-    is_temporary_chat   = EXCLUDED.is_temporary_chat,
-    workspace_id        = EXCLUDED.workspace_id,
-    conversation_origin = EXCLUDED.conversation_origin,
-    gizmo_id            = EXCLUDED.gizmo_id,
-    async_status        = EXCLUDED.async_status,
-    current_node        = EXCLUDED.current_node,
-    index_raw           = EXCLUDED.index_raw,
-    index_synced_at     = now()
--- Skip the write when the listing row is byte-identical. A conflicting row
--- filtered out here returns nothing, which is how the caller tells "already
--- current" from "new or changed" and stops paginating.
-WHERE conversations.index_raw IS DISTINCT FROM EXCLUDED.index_raw
-RETURNING id
-"""
 
-MESSAGE_INSERT = """
-INSERT INTO chatgpt.messages
-    (conversation_id, id, parent_id, children, role, author_name, recipient,
-     content_type, text, model_slug, status, end_turn, weight, create_time, raw)
-VALUES (%(conversation_id)s, %(id)s, %(parent_id)s, %(children)s, %(role)s,
-        %(author_name)s, %(recipient)s, %(content_type)s, %(text)s,
-        %(model_slug)s, %(status)s, %(end_turn)s, %(weight)s, %(create_time)s,
-        %(raw)s)
-"""
+def source_id_for(account: str | None) -> str:
+    return f"chatgpt:{account or 'default'}"
 
 
-class Store:
-    def __init__(self, dsn: str = DEFAULT_DSN):
-        self.conn = psycopg.connect(dsn, autocommit=False)
+def index_fields(source_id: str, item: dict) -> dict:
+    return {
+        "source_id": source_id,
+        "platform": "chatgpt",
+        "external_id": item["id"],
+        "title": item.get("title"),
+        "created_at": to_timestamp(item.get("create_time")),
+        "updated_at": to_timestamp(item.get("update_time")),
+        "workspace_id": item.get("workspace_id"),
+        "source_ref": f"https://chatgpt.com/c/{item['id']}",
+        "import_status": "pending",
+        "raw": item,
+    }
 
-    def close(self) -> None:
-        self.conn.close()
 
-    def __enter__(self) -> "Store":
-        return self
+def walk_mapping(mapping: dict) -> list[str]:
+    """Linearise the message tree depth-first from its roots.
 
-    def __exit__(self, *exc_info) -> None:
-        self.close()
+    A ChatGPT conversation is a tree — regenerations and edits create branches —
+    so there is no single correct flat order. Pre-order keeps each branch
+    contiguous, which is what reading surrounding context wants.
+    """
+    order: list[str] = []
+    seen: set[str] = set()
+    roots = [node_id for node_id, node in mapping.items() if not node.get("parent")]
+    stack = list(reversed(roots or list(mapping)))
+    while stack:
+        node_id = stack.pop()
+        if node_id in seen or node_id not in mapping:
+            continue
+        seen.add(node_id)
+        order.append(node_id)
+        for child in reversed(mapping[node_id].get("children") or []):
+            stack.append(child)
+    order.extend(node_id for node_id in mapping if node_id not in seen)
+    return order
 
-    def apply_schema(self) -> None:
-        with self.conn.cursor() as cur:
-            cur.execute(SCHEMA_PATH.read_text())
-        self.conn.commit()
 
-    def try_lock(self) -> bool:
-        """One sync at a time, so a manual run cannot collide with the daemon."""
-        with self.conn.cursor() as cur:
-            cur.execute("SELECT pg_try_advisory_lock(%s)", (SYNC_LOCK_KEY,))
-            (acquired,) = cur.fetchone()
-        self.conn.commit()
-        return bool(acquired)
+def body_messages(body: dict) -> list[dict]:
+    mapping = body.get("mapping") or {}
+    rows = []
+    for seq, node_id in enumerate(walk_mapping(mapping), start=1):
+        node = mapping[node_id]
+        message = node.get("message") or {}
+        author = message.get("author") or {}
+        content = message.get("content") or {}
+        metadata = message.get("metadata") or {}
 
-    def unlock(self) -> None:
-        with self.conn.cursor() as cur:
-            cur.execute("SELECT pg_advisory_unlock(%s)", (SYNC_LOCK_KEY,))
-        self.conn.commit()
+        parts = content.get("parts")
+        if isinstance(parts, list):
+            text = "\n".join(part for part in parts if isinstance(part, str)) or None
+        else:
+            text = content.get("text")
 
-    def mark_body_started(self, conversation_id: str) -> None:
-        with self.conn.cursor() as cur:
-            cur.execute(
-                "UPDATE chatgpt.conversations SET body_sync_started_at = now() WHERE id = %s",
-                (conversation_id,),
-            )
-        self.conn.commit()  # visible to the tray app while the fetch is running
+        role = author.get("role")
+        rows.append(
+            {
+                "seq": seq,
+                "external_id": node_id,
+                "parent_id": node.get("parent"),
+                "role": role,
+                "author": author.get("name") or metadata.get("model_slug"),
+                "content_type": content.get("content_type"),
+                "text": text,
+                "created_at": to_timestamp(message.get("create_time")),
+                "searchable": role not in ("system",),
+                "raw": node,
+            }
+        )
+    return rows
 
-    def get_state(self, key: str):
-        with self.conn.cursor() as cur:
-            cur.execute("SELECT value FROM chatgpt.sync_state WHERE key = %s", (key,))
-            row = cur.fetchone()
-        return row[0] if row else None
 
-    def set_state(self, key: str, value) -> None:
-        with self.conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO chatgpt.sync_state (key, value, updated_at) "
-                "VALUES (%s, %s, now()) "
-                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-                (key, Json(value)),
-            )
-        self.conn.commit()
+def pending_conversations(
+    store: Store, source_id: str, baseline: datetime | None, limit: int | None
+) -> list[tuple[int, str, str]]:
+    sql = [
+        "SELECT id, external_id, coalesce(title, '(untitled)') FROM hist.conversations",
+        "WHERE platform = 'chatgpt' AND source_id = %s",
+        "  AND (body_updated_at IS NULL OR body_updated_at < updated_at)",
+    ]
+    params: list = [source_id]
+    if baseline is not None:
+        sql.append("AND updated_at >= %s")
+        params.append(baseline)
+    sql.append("ORDER BY updated_at DESC")
+    if limit is not None:
+        sql.append("LIMIT %s")
+        params.append(limit)
+    with store.conn.cursor() as cur:
+        cur.execute(" ".join(sql), params)
+        return cur.fetchall()
 
-    def ensure_baseline(self) -> datetime:
-        """Timestamp separating skipped history from conversations we capture.
 
-        Set once, on the first run. Bodies are only fetched for conversations
-        updated at or after it, so a first run does not pull years of history.
-        """
-        existing = self.get_state("baseline_at")
-        if existing:
-            return datetime.fromisoformat(existing["value"])
-        now = datetime.now(timezone.utc)
-        self.set_state("baseline_at", {"value": now.isoformat()})
-        _log(f"baseline set to {now:%Y-%m-%d %H:%M:%SZ} — earlier history is indexed, not fetched")
-        return now
+def ensure_baseline(store: Store) -> datetime:
+    """Timestamp separating skipped history from conversations we capture.
 
-    def upsert_index(self, item: dict) -> bool:
-        """Store one listing row. Returns True when it was new or had changed.
+    Set once, on the first run. Bodies are only fetched for conversations
+    updated at or after it, so a first run does not pull years of history.
+    """
+    existing = store.get_state("baseline_at")
+    if existing:
+        return datetime.fromisoformat(existing["value"])
+    stamp = datetime.now(timezone.utc)
+    store.set_state("baseline_at", {"value": stamp.isoformat()})
+    _log(f"baseline set to {stamp:%Y-%m-%d %H:%M:%SZ} — earlier history is indexed, not fetched")
+    return stamp
 
-        Which conversations need bodies is a separate question, answered by
-        `pending()` against the whole table rather than page by page.
-        """
-        params = {
-            "id": item["id"],
-            "title": item.get("title"),
-            "create_time": to_timestamp(item.get("create_time")),
-            "update_time": to_timestamp(item.get("update_time")),
-            "is_archived": item.get("is_archived"),
-            "is_starred": item.get("is_starred"),
-            "is_temporary_chat": item.get("is_temporary_chat"),
-            "workspace_id": item.get("workspace_id"),
-            "conversation_origin": item.get("conversation_origin"),
-            "gizmo_id": item.get("gizmo_id"),
-            "async_status": None if item.get("async_status") is None else str(item["async_status"]),
-            "current_node": item.get("current_node"),
-            "index_raw": Json(item),
-        }
-        with self.conn.cursor() as cur:
-            cur.execute(CONVERSATION_UPSERT, params)
-            return cur.fetchone() is not None
 
-    def save_body(self, conversation_id: str, body: dict) -> int:
-        """Replace the stored body and messages for one conversation."""
-        update_time = to_timestamp(body.get("update_time"))
-        mapping = body.get("mapping") or {}
-        rows = []
-        for node_id, node in mapping.items():
-            message = node.get("message") or {}
-            author = message.get("author") or {}
-            content = message.get("content") or {}
-            metadata = message.get("metadata") or {}
-
-            parts = content.get("parts")
-            if isinstance(parts, list):
-                text = "\n".join(p for p in parts if isinstance(p, str)) or None
-            else:
-                text = content.get("text")
-
-            rows.append(
-                {
-                    "conversation_id": conversation_id,
-                    "id": node_id,
-                    "parent_id": node.get("parent"),
-                    "children": node.get("children") or [],
-                    "role": author.get("role"),
-                    "author_name": author.get("name"),
-                    "recipient": message.get("recipient"),
-                    "content_type": content.get("content_type"),
-                    "text": text,
-                    "model_slug": metadata.get("model_slug"),
-                    "status": message.get("status"),
-                    "end_turn": message.get("end_turn"),
-                    "weight": message.get("weight"),
-                    "create_time": to_timestamp(message.get("create_time")),
-                    "raw": Json(node),
-                }
-            )
-
-        with self.conn.cursor() as cur:
-            cur.execute(
-                "UPDATE chatgpt.conversations SET "
-                "  body_raw = %s, body_update_time = %s, body_synced_at = now(), "
-                "  title = coalesce(%s, title), current_node = coalesce(%s, current_node) "
-                "WHERE id = %s",
-                (Json(body), update_time, body.get("title"), body.get("current_node"), conversation_id),
-            )
-            cur.execute("DELETE FROM chatgpt.messages WHERE conversation_id = %s", (conversation_id,))
-            if rows:
-                cur.executemany(MESSAGE_INSERT, rows)
-        self.conn.commit()
-        return len(rows)
-
-    def pending(self, baseline: datetime | None, limit: int | None) -> list[tuple[str, str]]:
-        sql = [
-            "SELECT id::text, coalesce(title, '(untitled)') FROM chatgpt.conversations",
-            "WHERE (body_update_time IS NULL OR body_update_time < update_time)",
-        ]
-        params: list = []
-        if baseline is not None:
-            sql.append("AND update_time >= %s")
-            params.append(baseline)
-        sql.append("ORDER BY update_time DESC")
-        if limit is not None:
-            sql.append("LIMIT %s")
-            params.append(limit)
-        with self.conn.cursor() as cur:
-            cur.execute(" ".join(sql), params)
-            return cur.fetchall()
-
-    def start_run(self) -> int:
-        with self.conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO chatgpt.sync_runs (status) VALUES ('running') RETURNING id"
-            )
-            run_id = cur.fetchone()[0]
-        self.conn.commit()
-        return run_id
-
-    def finish_run(self, run_id: int, status: str, counts: dict, error: str | None = None) -> None:
-        with self.conn.cursor() as cur:
-            cur.execute(
-                "UPDATE chatgpt.sync_runs SET finished_at = now(), status = %s, "
-                "index_seen = %s, index_changed = %s, bodies_synced = %s, "
-                "messages_saved = %s, error = %s WHERE id = %s",
-                (
-                    status,
-                    counts.get("index_seen", 0),
-                    counts.get("index_changed", 0),
-                    counts.get("bodies_synced", 0),
-                    counts.get("messages_saved", 0),
-                    error,
-                    run_id,
-                ),
-            )
-        self.conn.commit()
+def record_runtime(store: Store, state: str, detail: str) -> bool:
+    """Persist the app/sync state and announce transitions. Returns True on change."""
+    previous = store.get_state("runtime") or {}
+    changed = previous.get("state") != state
+    stamp = datetime.now(timezone.utc).isoformat()
+    store.set_state(
+        "runtime",
+        {
+            "state": state,
+            "detail": detail,
+            "since": stamp if changed else previous.get("since", stamp),
+            "observed_at": stamp,
+        },
+    )
+    if changed:
+        if state != READY:
+            notify("ChatGPT sync stalled", detail)
+        elif previous:
+            notify("ChatGPT sync resumed", detail)
+    return changed
 
 
 # --------------------------------------------------------------------------
@@ -560,12 +450,12 @@ class Store:
 # --------------------------------------------------------------------------
 
 
-def sync_index(app: AppContext, store: Store, full: bool) -> dict:
+def sync_index(app: AppContext, store: Store, source_id: str, full: bool) -> dict:
     """Walk the listing newest-first, upserting rows.
 
-    Stops at the first page where nothing changed, unless ``full`` is set:
-    the listing is ordered by update time, so an unchanged page means
-    everything past it is unchanged too.
+    Stops at the first page where nothing changed, unless ``full`` is set: the
+    listing is ordered by update time, so an unchanged page means everything
+    past it is unchanged too.
     """
     seen = changed = offset = 0
     while not _shutdown:
@@ -575,83 +465,106 @@ def sync_index(app: AppContext, store: Store, full: bool) -> dict:
         page_changed = 0
         for item in items:
             seen += 1
-            if store.upsert_index(item):
-                page_changed += 1
+            fields = index_fields(source_id, item)
+            with store.conn.cursor() as cur:
+                cur.execute(
+                    "SELECT raw FROM hist.conversations WHERE source_id = %s AND external_id = %s",
+                    (source_id, item["id"]),
+                )
+                row = cur.fetchone()
+            if row is not None and row[0] == scrub(item):
+                continue
+            store.upsert_conversation(fields)
+            page_changed += 1
         store.conn.commit()
         changed += page_changed
         _log(f"  index offset {offset}: {len(items)} rows, {page_changed} new/changed")
         if page_changed == 0 and not full:
             break
         offset += PAGE_SIZE
-    return {"index_seen": seen, "index_changed": changed}
+    return {"seen": seen, "index_changed": changed}
 
 
-def sync_bodies(app: AppContext, store: Store, targets: list[tuple[str, str]], pause: float) -> dict:
-    bodies = messages = 0
-    for conversation_id, title in targets:
+def sync_bodies(
+    app: AppContext, store: Store, targets: list[tuple[int, str, str]], pause: float
+) -> dict:
+    bodies = messages = failed = 0
+    for conversation_id, external_id, title in targets:
         if _shutdown:
             break
-        store.mark_body_started(conversation_id)
-        body = app.conversation(conversation_id)
-        count = store.save_body(conversation_id, body)
-        bodies += 1
-        messages += count
-        _log(f"  saved {count:>4} messages  {title[:58]}")
+        with store.conn.cursor() as cur:
+            cur.execute(
+                "UPDATE hist.conversations SET body_started_at = now() WHERE id = %s",
+                (conversation_id,),
+            )
+        store.conn.commit()  # visible to the tray app while the fetch runs
+
+        try:
+            body = app.conversation(external_id)
+            rows = body_messages(body)
+            store.replace_messages(conversation_id, rows)
+            with store.conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE hist.conversations SET "
+                    "  raw = coalesce(raw, '{}'::jsonb), title = coalesce(%s, title), "
+                    "  body_updated_at = %s, body_imported_at = now(), "
+                    "  import_status = 'ok', import_error = NULL, imported_at = now() "
+                    "WHERE id = %s",
+                    (body.get("title"), to_timestamp(body.get("update_time")), conversation_id),
+                )
+            store.conn.commit()
+            bodies += 1
+            messages += len(rows)
+            _log(f"  saved {len(rows):>4} messages  {title[:56]}")
+        except Exception as exc:  # noqa: BLE001 - one bad conversation must stay visible
+            store.conn.rollback()
+            with store.conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE hist.conversations SET import_status = 'failed', import_error = %s "
+                    "WHERE id = %s",
+                    (f"{type(exc).__name__}: {exc}"[:2000], conversation_id),
+                )
+            store.conn.commit()
+            failed += 1
+            _log(f"  FAILED {title[:56]}: {type(exc).__name__}: {exc}")
         if pause:
             time.sleep(pause)
-    return {"bodies_synced": bodies, "messages_saved": messages}
+    return {"imported": bodies, "messages": messages, "failed": failed}
 
 
 def run_cycle(args, store: Store, app: AppContext) -> dict:
-    if not store.try_lock():
+    source_id = source_id_for(app.account)
+    store.upsert_source(source_id, "chatgpt", account=app.account, label="ChatGPT (personal)")
+    if not store.try_lock(source_id):
         _log("another sync holds the lock — skipping this cycle")
         return {}
-    baseline = store.ensure_baseline()
-    run_id = store.start_run()
+
+    baseline = ensure_baseline(store)
+    run_id = store.start_run(source_id)
     counts: dict = {}
     try:
-        counts.update(sync_index(app, store, full=args.full_index))
+        counts.update(sync_index(app, store, source_id, full=args.full_index))
         limit = None if args.limit in (None, 0) else args.limit
         window = None if args.backfill else baseline
-        targets = store.pending(window, limit)
+        targets = pending_conversations(store, source_id, window, limit)
         if targets:
             _log(f"  {len(targets)} conversation(s) need bodies")
             counts.update(sync_bodies(app, store, targets, args.pause))
         store.finish_run(run_id, "ok", counts)
+        store.set_source_status(source_id, "ok", f"{counts.get('imported', 0)} bodies this run")
     except Exception as exc:  # noqa: BLE001 - recorded and re-raised
         store.conn.rollback()
         store.finish_run(run_id, "error", counts, f"{type(exc).__name__}: {exc}")
+        store.set_source_status(source_id, "failed", f"{type(exc).__name__}: {exc}"[:400])
         raise
     finally:
-        store.unlock()
+        store.unlock(source_id)
     return counts
 
 
 # --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
-
-
-def record_runtime(store: Store, state: str, detail: str) -> bool:
-    """Persist the app/sync state and announce transitions. Returns True on change."""
-    previous = store.get_state("runtime") or {}
-    changed = previous.get("state") != state
-    now = datetime.now(timezone.utc).isoformat()
-    store.set_state(
-        "runtime",
-        {
-            "state": state,
-            "detail": detail,
-            "since": now if changed else previous.get("since", now),
-            "observed_at": now,
-        },
-    )
-    if changed:
-        if state != READY:
-            notify("ChatGPT sync stalled", detail)
-        elif previous:
-            notify("ChatGPT sync resumed", detail)
-    return changed
 
 
 def cmd_once(args) -> int:
@@ -665,11 +578,10 @@ def cmd_once(args) -> int:
         with AppContext(args.port) as app:
             counts = run_cycle(args, store, app)
         record_runtime(store, READY, "last cycle completed")
+    blank = {"seen": 0, "index_changed": 0, "imported": 0, "messages": 0, "failed": 0}
     _log(
-        "done: indexed {index_seen}, changed {index_changed}, "
-        "bodies {bodies_synced}, messages {messages_saved}".format(
-            **{**{"index_seen": 0, "index_changed": 0, "bodies_synced": 0, "messages_saved": 0}, **counts}
-        )
+        "done: indexed {seen}, changed {index_changed}, bodies {imported}, "
+        "messages {messages}, failed {failed}".format(**{**blank, **counts})
     )
     return 0
 
@@ -727,39 +639,34 @@ def cmd_stop(args) -> int:
 def cmd_status(args) -> int:
     with Store(args.dsn) as store:
         store.apply_schema()
+        runtime = store.get_state("runtime")
+        baseline = store.get_state("baseline_at")
+        cutoff = datetime.fromisoformat(baseline["value"]) if baseline else None
         with store.conn.cursor() as cur:
             cur.execute(
-                "SELECT count(*), count(body_raw), "
-                "       min(update_time), max(update_time) FROM chatgpt.conversations"
+                "SELECT count(*), count(*) FILTER (WHERE body_imported_at IS NOT NULL), "
+                "       min(updated_at), max(updated_at) "
+                "FROM hist.conversations WHERE platform = 'chatgpt'"
             )
             total, with_body, oldest, newest = cur.fetchone()
-            cur.execute("SELECT count(*) FROM chatgpt.messages")
-            (messages,) = cur.fetchone()
-            baseline = store.get_state("baseline_at")
-            cutoff = datetime.fromisoformat(baseline["value"]) if baseline else None
             cur.execute(
-                "SELECT count(*) FILTER (WHERE %s IS NULL OR update_time >= %s), count(*) "
-                "FROM chatgpt.pending",
+                "SELECT count(*) FILTER (WHERE %s IS NULL OR updated_at >= %s), count(*) "
+                "FROM hist.pending",
                 (cutoff, cutoff),
             )
-            due, skipped_total = cur.fetchone()
+            due, pending_total = cur.fetchone()
             cur.execute(
-                "SELECT started_at, status, index_seen, bodies_synced, error "
-                "FROM chatgpt.sync_runs ORDER BY id DESC LIMIT 5"
+                "SELECT title, updated_at, reason FROM hist.pending "
+                "WHERE %s IS NULL OR updated_at >= %s LIMIT 10",
+                (cutoff, cutoff),
+            )
+            rows = cur.fetchall()
+            cur.execute(
+                "SELECT started_at, status, seen, imported, error FROM hist.import_runs "
+                "WHERE source_id LIKE 'chatgpt:%%' ORDER BY id DESC LIMIT 5"
             )
             runs = cur.fetchall()
-            cur.execute(
-                "SELECT title, update_time, reason FROM chatgpt.pending "
-                "WHERE %s IS NULL OR update_time >= %s LIMIT 10",
-                (cutoff, cutoff),
-            )
-            pending_rows = cur.fetchall()
 
-    runtime = None
-    with Store(args.dsn) as store:
-        runtime = store.get_state("runtime")
-
-    history = skipped_total - due
     if runtime:
         marker = "ok" if runtime["state"] == READY else "!!"
         print(f"{marker} {runtime['state'].upper()}  {runtime['detail']}")
@@ -768,19 +675,18 @@ def cmd_status(args) -> int:
         print("?? never run")
     print()
     print(f"conversations   {total} ({with_body} with bodies)")
-    print(f"messages        {messages}")
-    print(f"update_time     {oldest} .. {newest}")
+    print(f"updated         {oldest} .. {newest}")
     print(f"baseline        {baseline['value'] if baseline else '(not set)'}")
     print(f"due now         {due}  (the daemon fetches these)")
-    print(f"pre-baseline    {history}  (skipped history; `backfill` to pull it)")
-    if pending_rows:
+    print(f"pre-baseline    {pending_total - due}  (skipped history; `backfill` to pull it)")
+    if rows:
         print("\ndue now:")
-        for title, update_time, reason in pending_rows:
-            print(f"  {update_time:%Y-%m-%d %H:%M}  {reason:<14} {(title or '')[:52]}")
+        for title, updated_at, reason in rows:
+            print(f"  {updated_at:%Y-%m-%d %H:%M}  {reason:<14} {(title or '')[:52]}")
     if runs:
         print("\nrecent runs:")
-        for started, status, seen, bodies, error in runs:
-            line = f"  {started:%Y-%m-%d %H:%M}  {status:<7} indexed={seen:<5} bodies={bodies}"
+        for started, status, seen, imported, error in runs:
+            line = f"  {started:%Y-%m-%d %H:%M}  {status:<7} indexed={seen:<5} bodies={imported}"
             print(line + (f"  {error[:60]}" if error else ""))
     return 0
 
@@ -792,13 +698,14 @@ def cmd_doctor(args) -> int:
         print(f"[ok]   debug port {args.port}: {version['Browser']}")
     elif app_running():
         print(f"[FAIL] {APP_NAME} is running WITHOUT --remote-debugging-port")
-        print(f"       nothing can be synced until it restarts:")
-        print(f"       ./chatgpt_sync.py start --force")
+        print("       nothing can be synced until it restarts:")
+        print("       ./chatgpt_sync.py start --force")
         return 1
     else:
         print(f"[warn] {APP_NAME} is not running; the daemon would start it")
-        print(f"       ./chatgpt_sync.py start")
+        print("       ./chatgpt_sync.py start")
         return 1
+
     targets = [t for t in http_json("/json/list", args.port) if "chatgpt.com" in t.get("url", "")]
     print(
         f"[ok]   chatgpt.com context present ({targets[0]['url'][:50]})"
@@ -850,7 +757,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     parser = argparse.ArgumentParser(
-        description="Sync ChatGPT conversations from the desktop app into Postgres.",
+        description="Sync personal ChatGPT conversations from the desktop app into Postgres.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
     for name, help_text in (
@@ -865,7 +772,6 @@ def main(argv: list[str] | None = None) -> int:
         sub.add_parser(name, parents=[common], help=help_text)
 
     args = parser.parse_args(argv)
-
     handlers = {
         "once": cmd_once,
         "daemon": cmd_daemon,
