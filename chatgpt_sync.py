@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -72,6 +73,92 @@ def to_timestamp(value) -> datetime | None:
 
 
 # --------------------------------------------------------------------------
+# App lifecycle
+#
+# Chromium only reads --remote-debugging-port at process start, so an app the
+# user launched from the Dock can never be attached to. The daemon therefore
+# owns launching it. States are written to chatgpt.sync_state so a wrapper (a
+# tray app, say) can render them without reimplementing any of this.
+# --------------------------------------------------------------------------
+
+APP_NAME = os.environ.get("CHATGPT_APP", "ChatGPT")
+APP_BINARY = f"/Applications/{APP_NAME}.app/Contents/MacOS/{APP_NAME}"
+
+READY = "ready"          # debug port reachable
+STALLED = "stalled"      # app is up, but without the port: nothing can be synced
+UNAVAILABLE = "unavailable"  # app is not running and could not be started
+
+
+def port_open(port: int) -> bool:
+    try:
+        http_json("/json/version", port, timeout=2.0)
+        return True
+    except CDPError:
+        return False
+
+
+def app_running() -> bool:
+    return subprocess.run(["pgrep", "-f", APP_BINARY], capture_output=True).returncode == 0
+
+
+def notify(title: str, message: str) -> None:
+    """Best-effort macOS notification. Never fatal: this is a status hint."""
+    script = f"display notification {json.dumps(message)} with title {json.dumps(title)}"
+    subprocess.run(["osascript", "-e", script], capture_output=True)
+
+
+def quit_app(wait: float = 20.0) -> bool:
+    subprocess.run(["osascript", "-e", f'quit app "{APP_NAME}"'], capture_output=True)
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if not app_running():
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def launch_app(port: int, wait: float = 40.0) -> bool:
+    subprocess.run(
+        ["open", "-a", APP_NAME, "--args", f"--remote-debugging-port={port}"],
+        capture_output=True,
+    )
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if port_open(port):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def ensure_app(port: int, policy: str) -> tuple[str, str]:
+    """Bring the app into a state the sync can attach to.
+
+    policy: 'missing' starts it when it is not running, 'always' additionally
+    restarts one that is running without the port, 'never' only ever attaches.
+    """
+    if port_open(port):
+        return READY, "debug port reachable"
+    if policy == "never":
+        return UNAVAILABLE, "port closed and --launch never"
+
+    running = app_running()
+    if running and policy != "always":
+        return STALLED, (
+            f"{APP_NAME} is running without --remote-debugging-port. "
+            f"Quit it and let the daemon start it, or use --launch always."
+        )
+    if running:
+        _log(f"restarting {APP_NAME}: running without the debug port")
+        if not quit_app():
+            return STALLED, f"{APP_NAME} would not quit"
+
+    _log(f"starting {APP_NAME} with --remote-debugging-port={port}")
+    if launch_app(port):
+        return READY, "started by the daemon"
+    return UNAVAILABLE, f"started {APP_NAME} but 127.0.0.1:{port} never opened"
+
+
+# --------------------------------------------------------------------------
 # App context
 # --------------------------------------------------------------------------
 
@@ -108,6 +195,13 @@ GET_JS = """
 })()
 """
 
+# A freshly launched app has targets whose reported URL is already chatgpt.com
+# while the document is still about:blank, and its session is restored a moment
+# after that. Both have to be waited out before priming.
+READY_JS = """
+(async () => JSON.stringify({origin: location.origin, readyState: document.readyState}))()
+"""
+
 
 class AppContext:
     """An authenticated chatgpt.com page inside the desktop app."""
@@ -119,34 +213,59 @@ class AppContext:
         self.created_target: str | None = None
         self.account: str | None = None
 
-    def _find_target(self) -> dict | None:
-        for target in http_json("/json/list", self.port):
-            if "chatgpt.com" in target.get("url", "") and target.get("webSocketDebuggerUrl"):
-                return target
-        return None
+    def _candidates(self) -> list[dict]:
+        return [
+            t
+            for t in http_json("/json/list", self.port)
+            if "chatgpt.com" in t.get("url", "") and t.get("webSocketDebuggerUrl")
+        ]
 
-    def _create_target(self) -> dict:
+    def _create_target(self) -> None:
         version = http_json("/json/version", self.port)
         with WebSocket(version["webSocketDebuggerUrl"], timeout=30) as browser:
             result = browser.call(
                 "Target.createTarget", {"url": "https://chatgpt.com/", "background": True}
             )
         self.created_target = result["targetId"]
-        for _ in range(40):
-            time.sleep(0.5)
-            target = self._find_target()
-            if target:
-                return target
-        raise CDPError("created a chatgpt.com target but it never became attachable")
+        _log("opened a chatgpt.com target for the sync")
 
-    def open(self) -> None:
-        target = self._find_target() or self._create_target()
-        self.ws = WebSocket(target["webSocketDebuggerUrl"], timeout=self.timeout)
-        info = evaluate(self.ws, PRIME_JS, timeout=self.timeout)
-        if not info.get("ok"):
-            raise CDPError(f"cannot use the app session: {info.get('error')}")
+    def _try(self, target: dict) -> str | None:
+        """Attach and prime one target. Returns None on success, else why not."""
+        try:
+            ws = WebSocket(target["webSocketDebuggerUrl"], timeout=self.timeout)
+        except CDPError as exc:
+            return str(exc)
+        try:
+            probe = evaluate(ws, READY_JS, timeout=30)
+            if probe.get("origin") != "https://chatgpt.com":
+                return f"origin is {probe.get('origin')}"
+            if probe.get("readyState") == "loading":
+                return "page still loading"
+            info = evaluate(ws, PRIME_JS, timeout=self.timeout)
+            if not info.get("ok"):
+                return str(info.get("error"))
+        except CDPError as exc:
+            ws.close()
+            return str(exc)
+        self.ws = ws
         self.account = info.get("account")
         _log(f"attached to {target['url'][:60]} (account {self.account})")
+        return None
+
+    def open(self, wait: float = 90.0) -> None:
+        deadline = time.time() + wait
+        reason = "no chatgpt.com target"
+        while time.time() < deadline and not _shutdown:
+            for target in self._candidates():
+                reason = self._try(target)
+                if reason is None:
+                    return
+            # Half the budget spent on the app's own targets; then open our own,
+            # in case the only candidate is a page that will never be usable.
+            if self.created_target is None and time.time() > deadline - wait / 2:
+                self._create_target()
+            time.sleep(2)
+        raise CDPError(f"no usable chatgpt.com context after {wait:.0f}s ({reason})")
 
     def close(self) -> None:
         if self.ws:
@@ -485,11 +604,39 @@ def run_cycle(args, store: Store, app: AppContext) -> dict:
 # --------------------------------------------------------------------------
 
 
+def record_runtime(store: Store, state: str, detail: str) -> bool:
+    """Persist the app/sync state and announce transitions. Returns True on change."""
+    previous = store.get_state("runtime") or {}
+    changed = previous.get("state") != state
+    now = datetime.now(timezone.utc).isoformat()
+    store.set_state(
+        "runtime",
+        {
+            "state": state,
+            "detail": detail,
+            "since": now if changed else previous.get("since", now),
+            "observed_at": now,
+        },
+    )
+    if changed:
+        if state != READY:
+            notify("ChatGPT sync stalled", detail)
+        elif previous:
+            notify("ChatGPT sync resumed", detail)
+    return changed
+
+
 def cmd_once(args) -> int:
     with Store(args.dsn) as store:
         store.apply_schema()
+        state, detail = ensure_app(args.port, args.launch)
+        record_runtime(store, state, detail)
+        if state != READY:
+            _log(f"{state}: {detail}")
+            return 1
         with AppContext(args.port) as app:
             counts = run_cycle(args, store, app)
+        record_runtime(store, READY, "last cycle completed")
     _log(
         "done: indexed {index_seen}, changed {index_changed}, "
         "bodies {bodies_synced}, messages {messages_saved}".format(
@@ -504,10 +651,16 @@ def cmd_daemon(args) -> int:
         store.apply_schema()
         while not _shutdown:
             try:
-                with AppContext(args.port) as app:
-                    run_cycle(args, store, app)
+                state, detail = ensure_app(args.port, args.launch)
+                if record_runtime(store, state, detail) and state != READY:
+                    _log(f"{state}: {detail}")
+                if state == READY:
+                    with AppContext(args.port) as app:
+                        run_cycle(args, store, app)
+                    record_runtime(store, READY, "last cycle completed")
             except CDPError as exc:
-                _log(f"app unavailable: {exc}")
+                _log(f"app unreachable: {exc}")
+                record_runtime(store, UNAVAILABLE, str(exc))
             except Exception as exc:  # noqa: BLE001 - daemon must survive a bad cycle
                 _log(f"cycle failed: {type(exc).__name__}: {exc}")
             for _ in range(int(args.interval)):
@@ -522,6 +675,25 @@ def cmd_backfill(args) -> int:
     args.backfill = True
     args.full_index = True
     return cmd_once(args)
+
+
+def cmd_start(args) -> int:
+    """Bring the app up with the debug port. Also the tray-app entry point."""
+    state, detail = ensure_app(args.port, "always" if args.force else "missing")
+    print(f"{state}: {detail}")
+    with Store(args.dsn) as store:
+        store.apply_schema()
+        record_runtime(store, state, detail)
+    return 0 if state == READY else 1
+
+
+def cmd_stop(args) -> int:
+    if not app_running():
+        print("not running")
+        return 0
+    ok = quit_app()
+    print("stopped" if ok else f"{APP_NAME} would not quit")
+    return 0 if ok else 1
 
 
 def cmd_status(args) -> int:
@@ -555,7 +727,18 @@ def cmd_status(args) -> int:
             )
             pending_rows = cur.fetchall()
 
+    runtime = None
+    with Store(args.dsn) as store:
+        runtime = store.get_state("runtime")
+
     history = skipped_total - due
+    if runtime:
+        marker = "ok" if runtime["state"] == READY else "!!"
+        print(f"{marker} {runtime['state'].upper()}  {runtime['detail']}")
+        print(f"   since {runtime['since'][:19]}, last checked {runtime['observed_at'][:19]}")
+    else:
+        print("?? never run")
+    print()
     print(f"conversations   {total} ({with_body} with bodies)")
     print(f"messages        {messages}")
     print(f"update_time     {oldest} .. {newest}")
@@ -576,11 +759,17 @@ def cmd_status(args) -> int:
 
 def cmd_doctor(args) -> int:
     ok = True
-    try:
+    if port_open(args.port):
         version = http_json("/json/version", args.port)
         print(f"[ok]   debug port {args.port}: {version['Browser']}")
-    except CDPError as exc:
-        print(f"[FAIL] debug port {args.port}: {exc}")
+    elif app_running():
+        print(f"[FAIL] {APP_NAME} is running WITHOUT --remote-debugging-port")
+        print(f"       nothing can be synced until it restarts:")
+        print(f"       ./chatgpt_sync.py start --force")
+        return 1
+    else:
+        print(f"[warn] {APP_NAME} is not running; the daemon would start it")
+        print(f"       ./chatgpt_sync.py start")
         return 1
     targets = [t for t in http_json("/json/list", args.port) if "chatgpt.com" in t.get("url", "")]
     print(
@@ -620,6 +809,17 @@ def main(argv: list[str] | None = None) -> int:
     common.add_argument(
         "--backfill", action="store_true", help="also fetch bodies for pre-baseline history"
     )
+    common.add_argument(
+        "--launch",
+        choices=("missing", "always", "never"),
+        default=os.environ.get("CHATGPT_SYNC_LAUNCH", "missing"),
+        help="missing: start the app when it is not running (default); "
+        "always: also restart one running without the debug port; "
+        "never: only attach to an app that already has the port",
+    )
+    common.add_argument(
+        "--force", action="store_true", help="`start`: restart the app even if it is running"
+    )
 
     parser = argparse.ArgumentParser(
         description="Sync ChatGPT conversations from the desktop app into Postgres.",
@@ -627,9 +827,11 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     for name, help_text in (
         ("once", "run a single sync cycle"),
-        ("daemon", "sync on an interval"),
+        ("daemon", "sync on an interval, starting the app as needed"),
         ("backfill", "fetch bodies for older conversations too"),
-        ("status", "show what is stored"),
+        ("status", "show sync state and what is stored"),
+        ("start", "start the app with the debug port"),
+        ("stop", "quit the app"),
         ("doctor", "check the app, the debug port, and the database"),
     ):
         sub.add_parser(name, parents=[common], help=help_text)
@@ -641,6 +843,8 @@ def main(argv: list[str] | None = None) -> int:
         "daemon": cmd_daemon,
         "backfill": cmd_backfill,
         "status": cmd_status,
+        "start": cmd_start,
+        "stop": cmd_stop,
         "doctor": cmd_doctor,
     }
     try:
