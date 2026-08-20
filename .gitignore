@@ -4,3 +4,8 @@
 # Local editor/OS files.
 .DS_Store
 *.swp
+
+# ChatGPT sync: local virtualenv, daemon logs, and Python caches.
+.venv/
+logs/
+__pycache__/
