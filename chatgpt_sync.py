@@ -35,6 +35,7 @@ from psycopg.types.json import Json
 from cdp import CDPError, WebSocket, evaluate, http_json
 
 DEFAULT_DSN = os.environ.get("CHATGPT_SYNC_DSN", "postgresql:///chatgpt_logs")
+SYNC_LOCK_KEY = 0x6368_6774  # 'chgt' — advisory lock shared by every entry point
 DEFAULT_PORT = int(os.environ.get("CHATGPT_SYNC_PORT", "9222"))
 SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
@@ -382,6 +383,27 @@ class Store:
             cur.execute(SCHEMA_PATH.read_text())
         self.conn.commit()
 
+    def try_lock(self) -> bool:
+        """One sync at a time, so a manual run cannot collide with the daemon."""
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (SYNC_LOCK_KEY,))
+            (acquired,) = cur.fetchone()
+        self.conn.commit()
+        return bool(acquired)
+
+    def unlock(self) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_unlock(%s)", (SYNC_LOCK_KEY,))
+        self.conn.commit()
+
+    def mark_body_started(self, conversation_id: str) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "UPDATE chatgpt.conversations SET body_sync_started_at = now() WHERE id = %s",
+                (conversation_id,),
+            )
+        self.conn.commit()  # visible to the tray app while the fetch is running
+
     def get_state(self, key: str):
         with self.conn.cursor() as cur:
             cur.execute("SELECT value FROM chatgpt.sync_state WHERE key = %s", (key,))
@@ -569,6 +591,7 @@ def sync_bodies(app: AppContext, store: Store, targets: list[tuple[str, str]], p
     for conversation_id, title in targets:
         if _shutdown:
             break
+        store.mark_body_started(conversation_id)
         body = app.conversation(conversation_id)
         count = store.save_body(conversation_id, body)
         bodies += 1
@@ -580,6 +603,9 @@ def sync_bodies(app: AppContext, store: Store, targets: list[tuple[str, str]], p
 
 
 def run_cycle(args, store: Store, app: AppContext) -> dict:
+    if not store.try_lock():
+        _log("another sync holds the lock — skipping this cycle")
+        return {}
     baseline = store.ensure_baseline()
     run_id = store.start_run()
     counts: dict = {}
@@ -596,6 +622,8 @@ def run_cycle(args, store: Store, app: AppContext) -> dict:
         store.conn.rollback()
         store.finish_run(run_id, "error", counts, f"{type(exc).__name__}: {exc}")
         raise
+    finally:
+        store.unlock()
     return counts
 
 

@@ -1,0 +1,14 @@
+{
+  "name": "chatgpt-sync-tray",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Menu bar app for the ChatGPT to Postgres sync daemon",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "icons": "python3 icons/make_icons.py && tauri icon icons/app-icon.png"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

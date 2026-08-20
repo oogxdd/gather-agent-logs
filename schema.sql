@@ -84,6 +84,42 @@ CREATE TABLE IF NOT EXISTS chatgpt.sync_runs (
     error          text
 );
 
+-- Set just before a body fetch and left in place, so a UI can tell "being
+-- checked right now" from "queued": in flight means it is newer than the last
+-- completed sync for that row.
+ALTER TABLE chatgpt.conversations
+    ADD COLUMN IF NOT EXISTS body_sync_started_at timestamptz;
+
+-- Per-conversation state for the tray app. `scope` separates the conversations
+-- the daemon actually manages from the history deliberately skipped at the
+-- baseline, so the UI does not show hundreds of false "not synced" rows.
+CREATE OR REPLACE VIEW chatgpt.overview AS
+SELECT c.id,
+       c.title,
+       c.create_time,
+       c.update_time,
+       c.body_update_time,
+       c.body_synced_at,
+       CASE
+           WHEN c.body_sync_started_at IS NOT NULL
+                AND (c.body_synced_at IS NULL OR c.body_sync_started_at > c.body_synced_at)
+               THEN 'syncing'
+           WHEN c.body_update_time IS NULL          THEN 'never'
+           WHEN c.body_update_time < c.update_time  THEN 'stale'
+           ELSE 'synced'
+       END AS status,
+       CASE
+           WHEN b.baseline IS NULL OR c.update_time >= b.baseline THEN 'managed'
+           ELSE 'history'
+       END AS scope,
+       (SELECT count(*) FROM chatgpt.messages m WHERE m.conversation_id = c.id) AS message_count
+FROM chatgpt.conversations c
+LEFT JOIN LATERAL (
+    SELECT (value ->> 'value')::timestamptz AS baseline
+    FROM chatgpt.sync_state
+    WHERE key = 'baseline_at'
+) b ON true;
+
 -- Conversations whose stored body is missing or older than the server's
 -- version. This is the "I started something, walked away, and never opened the
 -- answer" list.

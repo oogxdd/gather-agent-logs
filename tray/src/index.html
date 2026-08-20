@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ChatGPT Sync</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header>
+      <div class="row">
+        <span id="state-dot" class="dot off"></span>
+        <span id="state-label">checking…</span>
+        <button id="fix" class="link" hidden>Start</button>
+      </div>
+      <div class="row muted">
+        <span id="last-sync">last sync —</span>
+      </div>
+      <div class="row actions">
+        <button id="sync" class="primary">Sync now</button>
+        <span id="busy" class="spinner" hidden></span>
+        <span id="action-note" class="muted"></span>
+      </div>
+    </header>
+
+    <section id="counts" class="counts">
+      <div><b id="c-synced">0</b><span>synced</span></div>
+      <div><b id="c-stale">0</b><span>stale</span></div>
+      <div><b id="c-never">0</b><span>not synced</span></div>
+      <div><b id="c-syncing">0</b><span>checking</span></div>
+    </section>
+
+    <nav class="scope">
+      <button data-scope="managed" class="on">Tracked</button>
+      <button data-scope="all">All</button>
+      <span id="scope-note" class="muted"></span>
+    </nav>
+
+    <main>
+      <ul id="list"></ul>
+      <p id="empty" class="muted" hidden>Nothing here yet.</p>
+    </main>
+
+    <footer>
+      <span id="footer-note" class="muted"></span>
+    </footer>
+
+    <script src="main.js"></script>
+  </body>
+</html>
